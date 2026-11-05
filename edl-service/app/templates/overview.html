@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Overview{% endblock %}
+{% block content %}
+<h1>Current configuration</h1>
+<p class="muted">Read-only summary of every setting. Choose a section on the left to change it. Secrets are never shown.</p>
+
+{% for w in warnings %}<div class="banner warn">{{ w }}</div>{% endfor %}
+
+<div class="card">
+  <h2>Status</h2>
+  <dl class="kv">
+    <dt>Panorama</dt><dd><span class="tag {{ status.kind }}">{{ status.text }}</span> <span class="muted">{{ status.detail }}</span></dd>
+    <dt>Pending / unverified entries</dt><dd>{{ pending }}</dd>
+    <dt>Last processing run</dt><dd>{% if engine.last_run %}{{ engine.last_run | localtime('%Y-%m-%d %H:%M:%S') }}{% if engine.last_error %} <span class="tag err">error: {{ engine.last_error }}</span>{% endif %}{% else %}not yet{% endif %}</dd>
+    {% for snap in snapshots %}
+    <dt>Feed <code>{{ snap.list_name }}</code></dt><dd>{{ snap.entry_count }} entries, generated {{ snap.generated_at | localtime if snap.generated_at else "-" }}{% if snap.retained %} <span class="tag warn">retained</span>{% elif snap.differs %} <span class="tag warn">differs from eligible</span>{% endif %} · <code>/edl/{{ snap.list_name }}</code></dd>
+    {% endfor %}
+  </dl>
+</div>
+
+{% for sec, items in rows %}
+<div class="card">
+  <div class="bar"><h2 style="margin:0">{{ sec.label }}</h2><a class="btn" href="/admin/settings/{{ sec.id }}">Edit</a></div>
+  <dl class="kv" style="margin-top:10px">
+    {% for f, shown in items %}<dt title="{{ f.help }}">{{ f.label }}</dt><dd>{{ shown }}</dd>{% endfor %}
+  </dl>
+</div>
+{% endfor %}
+
+<div class="card">
+  <details>
+    <summary>Reset all settings to built-in defaults…</summary>
+    <form method="post" action="/admin/settings/reset-defaults" class="bar" style="margin-top:8px;display:flex">
+      <input type="hidden" name="csrf_token" value="{{ csrf }}">
+      <span class="muted">Replaces every setting with its default and clears all secrets (Panorama API key, feed password). Hosts and entries are kept.</span>
+      <button class="danger">Yes, reset everything</button>
+    </form>
+  </details>
+</div>
+{% endblock %}

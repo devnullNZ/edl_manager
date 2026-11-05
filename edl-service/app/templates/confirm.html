@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Confirm changes{% endblock %}
+{% block content %}
+<h1>Confirm changes to {{ section.label }}</h1>
+<div class="banner warn">
+  <strong>These changes can affect firewalls or published data:</strong>
+  <ul style="margin:6px 0 0 18px;padding:0">{% for r in plan.disruptive %}<li>{{ r }}</li>{% endfor %}</ul>
+</div>
+<div class="card">
+  <h2>Changes</h2>
+  <table><thead><tr><th>Setting</th><th>Current</th><th>New</th></tr></thead><tbody>
+    {% for c in plan.changes %}<tr><td>{{ c.label }}</td><td><code>{{ c.old }}</code></td><td><code>{{ c.new }}</code></td></tr>{% endfor %}
+  </tbody></table>
+</div>
+<form method="post" action="/admin/settings/confirm" class="bar">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <input type="hidden" name="token" value="{{ token }}">
+  <button class="primary">Confirm and save</button>
+  <a class="btn" href="/admin/settings/{{ section.id }}">Cancel</a>
+</form>
+{% endblock %}

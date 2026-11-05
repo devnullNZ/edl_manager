@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}{{ section.label }}{% endblock %}
+{% block content %}
+<h1>{{ section.label }}</h1>
+<p class="muted">{{ section.description }}</p>
+
+{% if errors %}<div class="banner err"><strong>Not saved:</strong><ul style="margin:6px 0 0 18px;padding:0">{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul></div>{% endif %}
+
+{% if section.id == 'panorama' %}
+  <div class="banner {{ extra.status.kind }}"><strong>Connection status:</strong> {{ extra.status.text }}{% if extra.status.detail %}<br><span>{{ extra.status.detail }}</span>{% endif %}</div>
+  {% if test %}
+  <div class="banner {{ 'ok' if test.ok else 'err' }}">
+    <strong>Test connection{% if not test.saved %} (using the values in the form, not saved){% endif %}:</strong> {{ test.message }}
+    {% if test.ok %}<br>{% if test.devicename %}Device {{ test.devicename }}{% endif %}{% if test.sw_version %} · PAN-OS {{ test.sw_version }}{% endif %} · {{ test.latency_ms }} ms{% endif %}
+  </div>
+  {% endif %}
+{% endif %}
+
+{% if section.id == 'edl' %}
+  <div class="card">
+    <h2>Published feeds</h2>
+    <p class="muted">Firewalls fetch <code>/edl/&lt;list name&gt;</code>{% if settings.edl_endpoint %} and, for the primary list, <code>{{ settings.edl_endpoint }}</code>{% endif %}. Plain text, one entry per line.</p>
+    {% if extra.snapshots %}
+    <table><thead><tr><th>List</th><th>Published</th><th>Eligible now</th><th>Not published (limit)</th><th>Generated</th><th>Serving</th></tr></thead><tbody>
+      {% for snap in extra.snapshots %}<tr>
+        <td><code>{{ snap.list_name }}</code>{% if snap.list_name == settings.edl_name %} <span class="tag muted">primary</span>{% endif %}</td>
+        <td>{{ snap.entry_count }}</td><td>{{ snap.eligible_count }}</td><td>{{ snap.truncated }}</td>
+        <td>{{ snap.generated_at | localtime if snap.generated_at else '' }}</td>
+        <td>{% if snap.retained %}<span class="tag warn">retained</span>{% elif snap.differs %}<span class="tag warn">differs</span>{% else %}<span class="tag">in sync</span>{% endif %}
+          <span class="muted">{{ snap.serving }}</span>
+          {% if snap.retained %}<br>{{ snap.note }}{% endif %}
+          {% if snap.differs %}<br><span class="muted">{{ snap.only_published }} entr{{ 'y' if snap.only_published == 1 else 'ies' }} only in the published feed{% if snap.sample_only_published %} (e.g. <code>{{ snap.sample_only_published[:3] | join(', ') }}</code>){% endif %}; {{ snap.only_eligible }} eligible but not published{% if snap.sample_only_eligible %} (e.g. <code>{{ snap.sample_only_eligible[:3] | join(', ') }}</code>){% endif %}.</span>{% endif %}
+          {% if snap.last_error %}<br><span class="tag err">last rebuild failed</span> <span class="muted">the previous version is still served</span>{% endif %}</td>
+      </tr>{% endfor %}
+    </tbody></table>
+    {% else %}<p class="muted">No feeds generated yet.</p>{% endif %}
+  </div>
+{% endif %}
+
+<form method="post" action="/admin/settings/{{ section.id }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf }}">
+  <fieldset>
+    <legend>{{ section.label }}</legend>
+    {% for f in section.fields %}
+    <div class="row">
+      <label for="{{ f.key }}" title="{{ f.help }}">{{ f.label }}</label>
+      <div>
+        {% if f.kind == 'bool' %}
+          <input type="checkbox" id="{{ f.key }}" name="{{ f.key }}" {% if values[f.key] %}checked{% endif %}>
+        {% elif f.kind == 'choice' %}
+          <select id="{{ f.key }}" name="{{ f.key }}">
+            {% for c in choices[f.key] %}<option value="{{ c }}" {% if values[f.key] == c %}selected{% endif %}>{{ c }}</option>{% endfor %}
+          </select>
+        {% elif f.kind == 'multiselect' %}
+          <div class="checks" role="group" aria-label="{{ f.label }}">
+            {% for c in choices[f.key] %}<label><input type="checkbox" name="{{ f.key }}" value="{{ c }}" {% if c in values[f.key] %}checked{% endif %}>{{ c }}</label>{% endfor %}
+          </div>
+        {% elif f.kind == 'secret' %}
+          <input type="password" id="{{ f.key }}" name="{{ f.key }}" autocomplete="new-password"
+                 placeholder="{{ '•••••••• configured: type to replace' if values[f.key] else 'not set' }}">
+          {% if values[f.key] %}<label class="inline"><input type="checkbox" name="{{ f.key }}__clear"> clear</label>{% endif %}
+        {% elif f.kind in ('text', 'list') %}
+          <textarea id="{{ f.key }}" name="{{ f.key }}">{{ values[f.key] | replace(',', '\n') if f.kind == 'list' else values[f.key] }}</textarea>
+        {% elif f.kind in ('int', 'float') %}
+          <input type="number" id="{{ f.key }}" name="{{ f.key }}" value="{{ values[f.key] }}" step="{{ 'any' if f.kind == 'float' else 1 }}">{% if f.unit %}<span class="unit">{{ f.unit }}</span>{% endif %}
+        {% else %}
+          <input type="text" id="{{ f.key }}" name="{{ f.key }}" value="{{ values[f.key] }}" autocomplete="off">
+        {% endif %}
+      </div>
+      {% if f.help %}<p class="help">{{ f.help }}</p>{% endif %}
+    </div>
+    {% endfor %}
+  </fieldset>
+  <div class="bar">
+    <button class="primary">Save</button>
+    <a class="btn" href="/admin/settings/{{ section.id }}">Cancel</a>
+    {% if section.id == 'panorama' %}<button formaction="/admin/settings/panorama/test">Test connection</button>{% endif %}
+  </div>
+</form>
+
+{% if section.id == 'processing' %}
+  <div class="card" style="margin-top:22px">
+    <h2>Engine status</h2>
+    <dl class="kv">
+      <dt>Pending / unverified entries</dt><dd>{{ extra.pending }}</dd>
+      <dt>Last run</dt><dd>{% if extra.engine.last_run %}{{ extra.engine.last_run | localtime('%Y-%m-%d %H:%M:%S') }}{% if extra.engine.last_error %} <span class="tag err">error: {{ extra.engine.last_error }}</span>{% endif %}{% else %}not yet{% endif %}</dd>
+      <dt>Last reclassification</dt><dd>{% if extra.last_reclass %}{{ extra.last_reclass.at[:16] | replace('T', ' ') }} UTC{% else %}not yet{% endif %}</dd>
+    </dl>
+    <div class="bar" style="margin-top:12px">
+      <form method="post" action="/admin/processing/run"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Run processing now</button></form>
+      <form method="post" action="/admin/processing/reclassify"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Reclassify all entries now</button></form>
+    </div>
+    <p class="muted">Both run even when background processing is disabled. Reclassification asks Panorama again for every entry.</p>
+  </div>
+{% endif %}
+{% endblock %}

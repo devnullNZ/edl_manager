@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Audit log{% endblock %}
+{% block content %}
+<h1>Audit log</h1>
+<p class="muted">Administrative actions and host submissions. Secret values are never recorded. Times are shown in the application timezone.</p>
+
+<div class="bar" style="margin-bottom:12px">
+  <a class="btn" href="/admin/audit">All</a>
+  <a class="btn" href="/admin/audit?kind=admin">Administrative</a>
+  <a class="btn" href="/admin/audit?kind=api">API submissions</a>
+  <span class="muted">{{ total }} record(s)</span>
+</div>
+
+<div class="card">
+  <table>
+    <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Details</th><th>From</th></tr></thead>
+    <tbody>
+    {% for r in rows %}
+      <tr>
+        <td>{{ r.ts | localtime('%Y-%m-%d %H:%M:%S') }}</td>
+        <td>{{ r.actor }}</td>
+        <td><code>{{ r.action }}</code></td>
+        <td>{{ r.target }}</td>
+        <td>{{ r.detail }}</td>
+        <td class="muted">{{ r.ip or '' }}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="6" class="muted">Nothing recorded yet.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="bar">
+  {% if page > 1 %}<a class="btn" href="/admin/audit?kind={{ kind }}&page={{ page - 1 }}">Newer</a>{% endif %}
+  <span class="muted">Page {{ page }} of {{ pages }}</span>
+  {% if page < pages %}<a class="btn" href="/admin/audit?kind={{ kind }}&page={{ page + 1 }}">Older</a>{% endif %}
+</div>
+{% endblock %}

@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block title %}Allowed hosts{% endblock %}
+{% block content %}
+<h1>Allowed hosts</h1>
+<p class="muted">Only these hosts may POST entries. Each request must carry that host's token as <code>Authorization: Bearer &lt;token&gt;</code>{% if settings.host_ip_restrictions_enabled %} and come from one of its addresses{% endif %}. Global behaviour (authentication, IP restrictions, rate limit, default expiry) is on the <a href="/admin/settings/security">Security and API</a> page.</p>
+
+{% if not settings.host_api_auth_enabled %}<div class="banner warn">Host authentication is switched <strong>off</strong>: submissions are accepted without a token, so the hosts below are not enforced.</div>{% endif %}
+{% if not settings.host_ip_restrictions_enabled %}<div class="banner warn">IP restrictions are switched <strong>off</strong>: a valid token works from any address.</div>{% endif %}
+{% if error %}<div class="banner err">{{ error }}</div>{% endif %}
+
+{% if new_token %}
+<div class="banner ok">
+  <strong>Token for {{ new_name }}</strong>: copy it now, it will not be shown again.
+  <pre>{{ new_token }}</pre>
+  <pre>curl -H "Authorization: Bearer {{ new_token }}" -H "Content-Type: application/json" \
+  -d '{"urls":["example.com"]}' https://&lt;this-server&gt;/v1/lists/default/entries</pre>
+</div>
+{% endif %}
+
+<div class="card">
+  <table>
+    <thead><tr><th>Host</th><th>Allowed addresses</th><th>Lists</th><th>Expires</th><th>Last used</th><th></th></tr></thead>
+    <tbody>
+    {% for h in hosts %}
+      <tr>
+        <td><strong>{{ h.name }}</strong><br>
+          <span class="tag {{ '' if h.enabled else 'off' }}">{{ 'enabled' if h.enabled else 'disabled' }}</span>
+          <span class="muted"><code>{{ h.token_prefix }}…</code></span></td>
+        <td><code>{{ h.addresses }}</code>{% if not settings.host_ip_restrictions_enabled %}<br><span class="muted">not enforced</span>{% endif %}</td>
+        <td><code>{{ h.lists }}</code></td>
+        <td>{% if h.expires_at %}{{ h.expires_at | localtime('%Y-%m-%d') }}{% if host_expired(h) %} <span class="tag err">expired</span>{% endif %}{% else %}<span class="muted">never</span>{% endif %}</td>
+        <td>{% if h.last_used_at %}{{ h.last_used_at | localtime }}<br><span class="muted">from {{ h.last_ip }}</span>{% else %}<span class="muted">never</span>{% endif %}</td>
+        <td>
+          <div class="actions">
+            <form method="post" action="/admin/hosts/{{ h.id }}/toggle"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>{{ 'Disable' if h.enabled else 'Enable' }}</button></form>
+          </div>
+          <details>
+            <summary>New token…</summary>
+            <form method="post" action="/admin/hosts/{{ h.id }}/regenerate">
+              <input type="hidden" name="csrf_token" value="{{ csrf }}">
+              <span class="muted">The current token stops working immediately.</span>
+              <button>Yes, issue a new token</button>
+            </form>
+          </details>
+          <details>
+            <summary>Delete…</summary>
+            <form method="post" action="/admin/hosts/{{ h.id }}/delete">
+              <input type="hidden" name="csrf_token" value="{{ csrf }}">
+              <span class="muted">Removes {{ h.name }} and its token.</span>
+              <button class="danger">Yes, delete this host</button>
+            </form>
+          </details>
+          <details>
+            <summary>Edit</summary>
+            <form method="post" action="/admin/hosts/{{ h.id }}/update">
+              <input type="hidden" name="csrf_token" value="{{ csrf }}">
+              <input type="text" name="name" value="{{ h.name }}" aria-label="Name">
+              <textarea name="addresses" aria-label="Addresses">{{ h.addresses }}</textarea>
+              <input type="text" name="lists" value="{{ h.lists }}" aria-label="Lists">
+              <input type="text" name="expiry" value="" placeholder="expiry: YYYY-MM-DD, never, or blank to keep" aria-label="Expiry">
+              <button class="primary">Save</button>
+            </form>
+          </details>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="6" class="muted">No hosts yet. Every authenticated POST to the API is currently rejected.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<fieldset>
+  <legend>Add a host</legend>
+  <form method="post" action="/admin/hosts">
+    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+    <div class="row"><label for="name">Name</label>
+      <div><input type="text" id="name" name="name" value="{{ form.name if form else '' }}" placeholder="ticketing-server" autocomplete="off"></div>
+      <p class="help">Used to attribute entries (stored as the entry's source).</p></div>
+    <div class="row"><label for="addresses">Allowed addresses</label>
+      <div><textarea id="addresses" name="addresses" placeholder="203.0.113.10, 198.51.100.0/24">{{ form.addresses if form else '' }}</textarea></div>
+      <p class="help">IPv4/IPv6 addresses or CIDR ranges, separated by commas or new lines. 0.0.0.0/0 is not accepted. Behind a reverse proxy, set FORWARDED_ALLOW_IPS so the real client address is seen.</p></div>
+    <div class="row"><label for="lists">Lists</label>
+      <div><input type="text" id="lists" name="lists" value="{{ form.lists if form else '*' }}" autocomplete="off"></div>
+      <p class="help"><code>*</code> for any list, or comma separated list names this host may write to.</p></div>
+    <div class="row"><label for="expiry">Token expiry</label>
+      <div><input type="text" id="expiry" name="expiry" value="{{ form.expiry if form else '' }}" placeholder="default ({{ settings.host_token_expiry_days }} days)" autocomplete="off"></div>
+      <p class="help">Leave blank for the default validity ({{ 'tokens never expire' if settings.host_token_expiry_days == 0 else settings.host_token_expiry_days ~ ' days' }}), <code>never</code>, or a date (YYYY-MM-DD).</p></div>
+    <button class="primary">Create host and generate token</button>
+  </form>
+</fieldset>
+{% endblock %}
