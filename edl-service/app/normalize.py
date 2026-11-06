@@ -19,16 +19,26 @@ class EntryTooLong(ValueError):
 
 
 def split_value(value: str) -> tuple[str, str]:
+    """(host, path). A domain root (`example.com/`) has an empty path; `example.com/login/` has `login/`."""
     host, _, path = value.partition("/")
     return host, path
 
 
-def normalize(raw: str) -> str:
-    """Return the canonical entry form: lowercase `host` or `host/path`.
+def is_root(value: str) -> bool:
+    """True for a domain root such as `example.com/` or `*.example.com/` (no path at all)."""
+    return split_value(value)[1] == ""
 
-    Strips scheme, credentials, port, query, fragment and trailing slashes.
-    Only a leading `*.` wildcard is accepted, and it may not target a public suffix
-    (`*.com`, `*.co.uk`, `*.com.au` ...). Raises ValueError if invalid.
+
+def normalize(raw: str) -> str:
+    """Return the canonical entry form: lowercase `host/` (domain root) or `host/path`.
+
+    - Domain roots always end in a slash: `example.com`, `https://example.com`, `example.com/`
+      and `*.example.com` become `example.com/` and `*.example.com/`.
+    - Strips scheme, credentials, port, query and fragment.
+    - Path-specific entries are NOT given a slash, and an existing trailing slash on a path is kept:
+      `example.com/login` and `example.com/login/` are different entries.
+    - Only a leading `*.` wildcard is accepted, and it may not target a public suffix
+      (`*.com`, `*.co.uk`, `*.com.au` ...). Raises ValueError if invalid.
     """
     s = raw.strip().lower()
     if not s:
@@ -38,7 +48,11 @@ def normalize(raw: str) -> str:
     host, _, path = s.partition("/")
     host = host.rsplit("@", 1)[-1]
     host = re.sub(r":\d+$", "", host).strip(".")
-    path = path.strip("/")
+    path = path.lstrip("/")
+    if path.endswith("/"):  # keep exactly one trailing slash on a path (it is significant)
+        path = path.rstrip("/") + "/"
+    if path == "/":
+        path = ""
 
     if not host:
         raise ValueError("missing host")
@@ -61,7 +75,7 @@ def normalize(raw: str) -> str:
         raise ValueError(f"wildcard '*.{base}' targets a public suffix and would cover unrelated sites; "
                          "use a registrable domain such as *.example." + base)
     host = prefix + base
-    value = f"{host}/{path}" if path else host
+    value = f"{host}/{path}"  # a root is `host/`
     if len(value) > MAX_ENTRY_LENGTH:
         raise EntryTooLong(len(value))
     return value

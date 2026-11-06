@@ -12,7 +12,7 @@ def test_tick_resolves_pending(client):
     client.fake.fail.clear()
     res = eng.tick()
     assert res["pending"]["checked"] == 1 and res["pending"]["changed"] == 1
-    assert feed(client).text.splitlines() == ["flaky.com"]
+    assert feed(client).text.splitlines() == ["flaky.com/"]
 
 
 def test_tick_retries_transient_failures(client):
@@ -22,7 +22,7 @@ def test_tick_retries_transient_failures(client):
     client.fake.fail.clear()
     client.fake.fail_next = 2                       # fails twice, third attempt succeeds
     eng.tick()
-    assert feed(client).text.splitlines() == ["flaky.com"]
+    assert feed(client).text.splitlines() == ["flaky.com/"]
 
 
 def test_batch_size_limits_one_run(client):
@@ -45,7 +45,7 @@ def test_disabled_background_processing_skips_but_manual_run_works(client):
     assert "skipped" in eng.tick()
     assert feed(client).text.strip() == ""
     assert eng.tick(force=True)["pending"]["changed"] == 1
-    assert feed(client).text.splitlines() == ["flaky.com"]
+    assert feed(client).text.splitlines() == ["flaky.com/"]
 
 
 def test_scheduled_loop_does_not_run_when_disabled(client):
@@ -66,7 +66,7 @@ def test_unverified_entries_are_rechecked_and_removed_when_bad(client):
     put_settings(client, {"classification_failure_behaviour": "fail-open"}, confirm=True)
     client.fake.fail.add("bad.later.com")
     assert post(client, ["bad.later.com"])["results"][0]["status"] == "added"      # published, unverified
-    assert feed(client).text.splitlines() == ["bad.later.com"]        # published while unverified
+    assert feed(client).text.splitlines() == ["bad.later.com/"]        # published while unverified
     client.fake.fail.clear()
     eng.tick()
     assert feed(client).text.strip() == ""                            # classified malware -> pulled
@@ -89,7 +89,7 @@ def test_run_now_via_admin_ui(client):
     client.fake.fail.clear()
     r = ui_post(client, "/admin/processing/run")
     assert r.status_code in (302, 303)
-    assert feed(client).text.splitlines() == ["flaky.com"]
+    assert feed(client).text.splitlines() == ["flaky.com/"]
 
 
 def test_concurrent_tick_is_skipped(client):

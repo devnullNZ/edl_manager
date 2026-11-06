@@ -15,11 +15,11 @@ def test_dedupe_shadow_and_category(client):
     assert by["example.com"]["status"] == "duplicate"
     assert by["*.example.com"]["status"] == "added"
     assert by["1.example.com"]["published"] is False
-    assert by["1.example.com"]["shadowed_by"] == "*.example.com"
+    assert by["1.example.com"]["shadowed_by"] == "*.example.com/"
     assert by["bad.evil.net"]["status"] == "blocked"
     assert by["not a url!"]["status"] == "invalid"
 
-    assert client.get("/edl/default").text.splitlines() == ["*.example.com", "example.com"]
+    assert client.get("/edl/default").text.splitlines() == ["*.example.com/", "example.com/"]
 
     n = len(client.fake.calls)
     again = post(client, ["example.com", "bad.evil.net"])
@@ -30,10 +30,10 @@ def test_dedupe_shadow_and_category(client):
 def test_removing_wildcard_unshadows(client):
     apex_policy(client)
     post(client, ["*.example.com", "1.example.com"])
-    assert client.get("/edl/default").text.splitlines() == ["*.example.com"]
+    assert client.get("/edl/default").text.splitlines() == ["*.example.com/"]
     r = client.request("DELETE", "/v1/lists/default/entries", json={"urls": ["*.example.com"]}, headers=KEY)
     assert r.json() == {"deleted": 1}
-    assert client.get("/edl/default").text.splitlines() == ["1.example.com"]
+    assert client.get("/edl/default").text.splitlines() == ["1.example.com/"]
 
 
 def test_panorama_failure_is_pending_not_published_then_recovers(client):
@@ -44,12 +44,12 @@ def test_panorama_failure_is_pending_not_published_then_recovers(client):
     client.fake.fail.clear()
     r = client.post("/v1/lists/default/recheck", headers=KEY)
     assert r.json() == {"checked": 1, "changed": 1}
-    assert client.get("/edl/default").text.splitlines() == ["flaky.com"]
+    assert client.get("/edl/default").text.splitlines() == ["flaky.com/"]
 
 
 def test_recheck_pulls_entry_that_became_malicious(client):
     post(client, ["turned.bad.com"])
-    assert client.get("/edl/default").text.splitlines() == ["turned.bad.com"]
+    assert client.get("/edl/default").text.splitlines() == ["turned.bad.com/"]
     client.fake.lookup = lambda t: f"{t} malware (Cloud db)"
     client.post("/v1/lists/default/recheck", headers=KEY)
     assert client.get("/edl/default").text == ""

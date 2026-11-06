@@ -1,6 +1,11 @@
 {% extends "base.html" %}
 {% block title %}Overview{% endblock %}
 {% block content %}
+{% macro breakdown_table(rows) %}
+<table><thead><tr><th>List</th><th title="Every stored entry">Uploaded</th><th title="Classified acceptable (status active)">Approved</th><th title="High-risk or excluded; never published">Blocked</th><th title="Classification not obtained yet; never published (the backlog)">Pending</th><th title="Classification failed under fail-open; published and re-checked">Unverified</th><th title="Approved entries hidden by an approved wildcard (a subset of Approved)">Suppressed</th><th title="Switched off by an administrator">Disabled</th><th title="Lines in the feed being served">Published</th></tr></thead><tbody>
+{% for r in rows %}<tr><td><code>{{ r.list_name }}</code></td><td>{{ r.uploaded }}</td><td>{{ r.approved }}</td><td>{{ r.blocked }}</td><td>{{ r.pending }}</td><td>{{ r.unverified }}</td><td>{{ r.suppressed }}</td><td>{{ r.disabled }}</td><td>{{ r.published }}</td></tr>{% else %}<tr><td colspan="9" class="muted">No entries yet.</td></tr>{% endfor %}
+</tbody></table>
+{% endmacro %}
 <h1>Current configuration</h1>
 <p class="muted">Read-only summary of every setting. Choose a section on the left to change it. Secrets are never shown.</p>
 
@@ -11,11 +16,19 @@
   <dl class="kv">
     <dt>Panorama</dt><dd><span class="tag {{ status.kind }}">{{ status.text }}</span> <span class="muted">{{ status.detail }}</span></dd>
     <dt>Pending / unverified entries</dt><dd>{{ pending }}</dd>
+    <dt>Awaiting reclassification</dt><dd>{{ reclass_remaining }}</dd>
+    <dt>Engine</dt><dd>{% set pg = engine.progress %}{% if pg %}{{ pg.state }}{% if pg.state == 'draining' %} (batch {{ pg.batches }}, {{ pg.processed }} entries handled){% endif %}{% else %}not yet run{% endif %}</dd>
     <dt>Last processing run</dt><dd>{% if engine.last_run %}{{ engine.last_run | localtime('%Y-%m-%d %H:%M:%S') }}{% if engine.last_error %} <span class="tag err">error: {{ engine.last_error }}</span>{% endif %}{% else %}not yet{% endif %}</dd>
     {% for snap in snapshots %}
     <dt>Feed <code>{{ snap.list_name }}</code></dt><dd>{{ snap.entry_count }} entries, generated {{ snap.generated_at | localtime if snap.generated_at else "-" }}{% if snap.retained %} <span class="tag warn">retained</span>{% elif snap.differs %} <span class="tag warn">differs from eligible</span>{% endif %} · <code>/edl/{{ snap.list_name }}</code></dd>
     {% endfor %}
   </dl>
+</div>
+
+<div class="card">
+  <h2>Entries by state</h2>
+  {{ breakdown_table(breakdown) }}
+  <p class="muted">Uploaded = every stored entry. Pending entries are the classification backlog and are never published. Suppressed entries are approved but hidden by an approved wildcard; nothing is deleted for that reason.</p>
 </div>
 
 {% for sec, items in rows %}

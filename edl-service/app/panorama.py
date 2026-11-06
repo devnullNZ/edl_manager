@@ -144,7 +144,7 @@ def parse_result_text(text: str, target: str) -> Classification:
     this shape) yields nothing. Raises PanoramaError if no line can be understood: the caller must
     treat that as a failed lookup, never as 'no categories'."""
     host, _ = split_value(target.lower())
-    accepted = {target.lower(), host}
+    accepted = {target.lower(), target.lower().rstrip("/"), host}  # a path may end in "/" (it is significant)
     cats: list[str] = []
     dbs: list[str] = []
     for line in text.splitlines():

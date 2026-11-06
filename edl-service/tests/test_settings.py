@@ -130,7 +130,7 @@ def test_valid_endpoint_accepted_and_served(client):
     post(client, ["a.example.com"])
     put_settings(client, {"edl_endpoint": "/feeds/blocklist.txt"}, confirm=True)
     r = client.get("/feeds/blocklist.txt")
-    assert r.status_code == 200 and r.text.splitlines() == ["a.example.com"]
+    assert r.status_code == 200 and r.text.splitlines() == ["a.example.com/"]
     assert client.get("/feeds/other.txt").status_code == 404
     assert client.get("/edl/default").text == r.text          # built-in path still works
 
@@ -307,17 +307,17 @@ def test_cache_kept_when_unrelated_setting_changes(client):
 
 def test_feed_rebuilt_when_high_risk_set_changes(client):
     post(client, ["bad.evil.net", "ok.example.com"])
-    assert feed(client).text.splitlines() == ["ok.example.com"]
+    assert feed(client).text.splitlines() == ["ok.example.com/"]
     put_settings(client, {"high_risk_categories": ["phishing"]}, confirm=True)
     client.post("/v1/lists/default/recheck", headers=KEY)
-    assert sorted(feed(client).text.splitlines()) == ["bad.evil.net", "ok.example.com"]
+    assert sorted(feed(client).text.splitlines()) == ["bad.evil.net/", "ok.example.com/"]
 
 
 def test_snapshot_rebuilt_when_max_entries_changes(client):
     post(client, ["a.example.com", "b.example.com", "c.example.com"])
     assert len(feed(client).text.splitlines()) == 3
     put_settings(client, {"edl_max_entries": 2}, confirm=True)
-    assert feed(client).text.splitlines() == ["a.example.com", "b.example.com"]   # oldest kept
+    assert feed(client).text.splitlines() == ["a.example.com/", "b.example.com/"]   # oldest kept
     put_settings(client, {"edl_max_entries": 0}, confirm=True)
     assert len(feed(client).text.splitlines()) == 3
 
@@ -329,7 +329,7 @@ def test_classification_disabled_makes_no_panorama_calls(client):
     out = post(client, ["bad.evil.net", "x.example.com"])
     assert {r["status"] for r in out["results"]} == {"added"}
     assert len(client.fake.calls) == n
-    assert sorted(feed(client).text.splitlines()) == ["bad.evil.net", "x.example.com"]
+    assert sorted(feed(client).text.splitlines()) == ["bad.evil.net/", "x.example.com/"]
 
 
 def test_reenabling_classification_filters_again(client):
@@ -366,7 +366,7 @@ def test_publishing_disabled_returns_503_and_reenable_restores(client):
     put_settings(client, {"edl_publishing_enabled": False}, confirm=True)
     assert feed(client).status_code == 503
     put_settings(client, {"edl_publishing_enabled": True})
-    assert feed(client).text.splitlines() == ["a.example.com"]
+    assert feed(client).text.splitlines() == ["a.example.com/"]
 
 
 def test_feed_is_plain_text_one_per_line_with_etag(client):
@@ -374,7 +374,7 @@ def test_feed_is_plain_text_one_per_line_with_etag(client):
     post(client, ["a.example.com", "*.b.example.com"])
     r = feed(client)
     assert r.headers["content-type"].startswith("text/plain")
-    assert r.text.splitlines() == ["*.b.example.com", "a.example.com"]
+    assert r.text.splitlines() == ["*.b.example.com/", "a.example.com/"]
     assert feed(client, headers={"If-None-Match": r.headers["etag"]}).status_code == 304
 
 
@@ -387,7 +387,7 @@ def test_empty_behaviours(client):
     put_settings(client, {"edl_empty_behaviour": "keep-previous"}, confirm=True)
     post(client, ["b.example.com"])
     client.request("DELETE", "/v1/lists/default/entries", json={"urls": ["b.example.com"]}, headers=KEY)
-    assert feed(client).text.splitlines() == ["b.example.com"]
+    assert feed(client).text.splitlines() == ["b.example.com/"]
 
 
 def test_existing_feed_survives_rebuild_failure(client, monkeypatch):

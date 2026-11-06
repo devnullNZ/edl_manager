@@ -13,8 +13,11 @@ log = logging.getLogger("edl")
 
 
 def record(db: Session, *, actor: str, action: str, target: str = "", detail: str = "",
-           ip: str | None = None, kind: str = "admin") -> bool:
-    """Write an audit record if auditing is enabled for this kind. Never raises."""
+           ip: str | None = None, kind: str = "admin", commit: bool = True) -> bool:
+    """Write an audit record if auditing is enabled for this kind. Never raises.
+
+    commit=False adds the record to the caller's transaction instead (used by sync, so the audit
+    trail and the change it describes are committed, or rolled back, together)."""
     s = get_settings()
     if kind == "admin" and not s.audit_logging_enabled:
         return False
@@ -23,10 +26,14 @@ def record(db: Session, *, actor: str, action: str, target: str = "", detail: st
     try:
         db.add(AuditLog(kind=kind, actor=actor[:128], action=action[:64], target=target[:256],
                         detail=detail[:4000], ip=ip))
-        db.commit()
+        if commit:
+            db.commit()
         return True
     except Exception:
-        db.rollback()
+        if commit:
+            db.rollback()
+        else:
+            raise
         log.exception("could not write audit record")
         return False
 

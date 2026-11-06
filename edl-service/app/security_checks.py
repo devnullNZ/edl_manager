@@ -35,6 +35,10 @@ def system_warnings() -> list[tuple[str, str]]:
     for key in settings_store.secret_problems():
         out.append(("err", f"Secret '{key}' cannot be decrypted with ENCRYPTION_KEY. Restore the original key, or "
                            "re-enter the secret. The stored value has not been changed."))
+    if s.wildcard_classification_policy == "apex-classification" and not s.classification_enabled:
+        out.append(("warn", "The wildcard policy is 'Classify Apex Domain' but classification is disabled: wildcard "
+                            "entries cannot be approved and stay pending (unpublished) until classification is "
+                            "enabled."))
     if get_bootstrap().encryption_key_previous:
         out.append(("warn", "ENCRYPTION_KEY_PREVIOUS is set (key rotation window). Once all secrets show as "
                             "current, remove it and restart."))

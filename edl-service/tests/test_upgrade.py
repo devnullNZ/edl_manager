@@ -53,12 +53,12 @@ def test_full_upgrade_preserves_entries_and_settings(client):
     assert s.wildcard_classification_policy == "exclude"               # new setting seeded with its default
     with client.factory() as db:
         rows = {e.value: (e.status, e.detail) for e in db.query(Entry)}
-        assert set(rows) == {"keep.example.com", "*.example.org", "*.com"}      # nothing deleted
-        assert rows["keep.example.com"][0] == "active"
-        assert rows["*.example.org"][0] == "blocked" and "wildcard" in rows["*.example.org"][1]
-        assert rows["*.com"][0] == "blocked" and "public suffix" in rows["*.com"][1]
-        assert db.get(EdlSnapshot, "default").body == "keep.example.com\n"
-    assert client.get("/edl/default").text == "keep.example.com\n"
+        assert set(rows) == {"keep.example.com/", "*.example.org/", "*.com/"}    # nothing deleted; roots gain the slash
+        assert rows["keep.example.com/"][0] == "active"
+        assert rows["*.example.org/"][0] == "blocked" and "wildcard" in rows["*.example.org/"][1]
+        assert rows["*.com/"][0] == "blocked" and "public suffix" in rows["*.com/"][1]
+        assert db.get(EdlSnapshot, "default").body == "keep.example.com/\n"
+    assert client.get("/edl/default").text == "keep.example.com/\n"
 
 
 def test_upgrade_is_idempotent(client):

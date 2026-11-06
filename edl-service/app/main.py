@@ -15,16 +15,17 @@ from starlette.middleware.sessions import SessionMiddleware
 from starlette.routing import Match
 
 from . import __version__, audit, migrations, ratelimit, runtime, security_checks, service, settings_store
+from . import sync as sync_mod
+from . import sync_sessions as sessions_mod
 from . import db as dbmod
 from . import hosts as hosts_mod
 from .admin import router as admin_router
 from .admin_api import router as admin_api_router
 from .auth import basic, edl_auth, require_api_key
 from .config import get_bootstrap, get_settings
-from .db import AllowedHost, Entry, get_db
+from .db import AllowedHost, Entry, EntrySource, get_db
 from .engine import processing_engine
 from .panorama import PanoramaError
-from .shadow import compute_shadows
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("edl")
@@ -147,18 +148,21 @@ def _serve_feed(request: Request, db: Session, list_name: str) -> Response:
     s = get_settings()
     if not s.edl_publishing_enabled:
         return PlainTextResponse("EDL publishing is disabled\n", status_code=503, headers={"Retry-After": "300"})
-    snap = service.get_snapshot(db, list_name)
+    snap = service.get_snapshot_meta(db, list_name)
     if snap is None:
         return PlainTextResponse("feed unavailable\n", status_code=503, headers={"Retry-After": "60"})
     if snap.entry_count == 0 and s.edl_empty_behaviour == "return-error":
         return PlainTextResponse("no valid entries\n", status_code=503, headers={"Retry-After": "300"})
-    generated = snap.generated_at if snap.generated_at.tzinfo else snap.generated_at.replace(tzinfo=timezone.utc)
-    etag = f'"{snap.etag}"'
-    headers = {"ETag": etag, "Last-Modified": format_datetime(generated.astimezone(timezone.utc), usegmt=True),
-               "Cache-Control": "no-cache"}
-    if request.headers.get("if-none-match") == etag:
-        return Response(status_code=304, headers=headers)
-    return Response(content=snap.body, media_type="text/plain; charset=utf-8", headers=headers)
+
+    def headers_for(sn) -> dict:
+        generated = sn.generated_at if sn.generated_at.tzinfo else sn.generated_at.replace(tzinfo=timezone.utc)
+        return {"ETag": f'"{sn.etag}"', "Last-Modified": format_datetime(generated.astimezone(timezone.utc), usegmt=True),
+                "Cache-Control": "no-cache"}
+
+    if request.headers.get("if-none-match") == f'"{snap.etag}"':
+        return Response(status_code=304, headers=headers_for(snap))
+    snap, data = service.feed_bytes(db, snap)
+    return Response(content=data, media_type="text/plain; charset=utf-8", headers=headers_for(snap))
 
 
 @app.get("/edl/{name}", response_class=Response, dependencies=[Depends(edl_auth)])
@@ -180,7 +184,7 @@ def add_entries(name: str, body: UrlsIn, request: Request, db: Annotated[Session
     actor = host.name if host else "anonymous"
     source = f"{actor}:{body.source}" if body.source else actor
     try:
-        results = service.add_urls(db, _check_list(name), body.urls, source)
+        results = service.add_urls(db, _check_list(name), body.urls, source, owner=(actor[:64], (body.source or "")[:100]))
     except service.SubmissionError as exc:
         raise HTTPException(422, detail={"errors": exc.errors}) from None
     counts: dict[str, int] = {}
@@ -190,6 +194,98 @@ def add_entries(name: str, body: UrlsIn, request: Request, db: Annotated[Session
                  ip=request.client.host if request.client else None,
                  detail=f"{len(body.urls)} URL(s): " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
     return {"summary": counts, "results": results}
+
+
+@app.post("/v1/lists/{name}/sync")
+def sync_list(name: str, body: sync_mod.SyncIn, request: Request, db: Annotated[Session, Depends(get_db)],
+              host: Annotated[AllowedHost | None, Depends(host_auth)]):
+    """Reconcile the entries owned by one source (this host + `source`) with the desired state sent.
+
+    Requires the host's bearer token and permission for the list. Only entries owned by this source are
+    ever removed, and only with delete_missing=true. dry_run=true changes nothing."""
+    try:
+        return sync_mod.run_sync(db, list_name=_check_list(name), host=host.name if host else None, req=body,
+                                 ip=request.client.host if request.client else None)
+    except sync_mod.SyncRejected as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {"errors": [exc.detail]}
+        raise HTTPException(exc.status_code, detail=detail) from None
+
+
+def _sessions_call(fn, **kw):
+    try:
+        return fn(**kw)
+    except sync_mod.SyncRejected as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {"errors": [exc.detail]}
+        raise HTTPException(exc.status_code, detail=detail) from None
+
+
+@app.post("/v1/lists/{name}/sync/sessions")
+def sync_session_start(name: str, body: sessions_mod.SessionStart, request: Request,
+                       db: Annotated[Session, Depends(get_db)],
+                       host: Annotated[AllowedHost | None, Depends(host_auth)]):
+    """Start (or resume) a chunked sync. Repeating the call with the same source and sync_id returns the
+    open session and which chunks it already holds."""
+    return _sessions_call(sessions_mod.start, db=db, list_name=_check_list(name), host=host.name if host else None,
+                          body=body, ip=request.client.host if request.client else None)
+
+
+@app.get("/v1/lists/{name}/sync/sessions/{session_id}")
+def sync_session_status(name: str, session_id: int, db: Annotated[Session, Depends(get_db)],
+                        host: Annotated[AllowedHost | None, Depends(host_auth)]):
+    return _sessions_call(sessions_mod.status, db=db, list_name=_check_list(name),
+                          host=host.name if host else None, session_id=session_id)
+
+
+@app.put("/v1/lists/{name}/sync/sessions/{session_id}/chunks/{index}")
+def sync_session_chunk(name: str, session_id: int, index: int, body: sessions_mod.ChunkIn,
+                       db: Annotated[Session, Depends(get_db)],
+                       host: Annotated[AllowedHost | None, Depends(host_auth)]):
+    """Stage one chunk. Safe to repeat: an identical chunk is acknowledged again. Nothing is applied."""
+    return _sessions_call(sessions_mod.put_chunk, db=db, list_name=_check_list(name),
+                          host=host.name if host else None, session_id=session_id, index=index, body=body)
+
+
+@app.post("/v1/lists/{name}/sync/sessions/{session_id}/commit")
+def sync_session_commit(name: str, session_id: int, body: sessions_mod.CommitIn, request: Request,
+                        db: Annotated[Session, Depends(get_db)],
+                        host: Annotated[AllowedHost | None, Depends(host_auth)]):
+    """Reconcile the staged desired state. Refused (409, nothing applied) unless every chunk arrived."""
+    return _sessions_call(sessions_mod.commit, db=db, list_name=_check_list(name),
+                          host=host.name if host else None, session_id=session_id, body=body,
+                          ip=request.client.host if request.client else None)
+
+
+@app.get("/v1/lists/{name}/sync/sessions/{session_id}/invalid")
+def sync_session_invalid(name: str, session_id: int, db: Annotated[Session, Depends(get_db)],
+                         host: Annotated[AllowedHost | None, Depends(host_auth)],
+                         offset: int = 0, limit: int = 200):
+    """Entries of this session that failed validation (chunk, position in chunk, reason), paged."""
+    return _sessions_call(sessions_mod.invalid_entries, db=db, list_name=_check_list(name),
+                          host=host.name if host else None, session_id=session_id, offset=offset, limit=limit)
+
+
+@app.get("/v1/lists/{name}/sync/reclassifications/{job_id}")
+def sync_reclassification_status(name: str, job_id: int, db: Annotated[Session, Depends(get_db)],
+                                 host: Annotated[AllowedHost | None, Depends(host_auth)]):
+    """Progress of a reclassification started with `reclassify=true`. The job survives restarts and is
+    worked off by the background engine; `remaining` is the number of entries still waiting."""
+    from .db import ReclassJob
+    list_name = _check_list(name)
+    job = db.get(ReclassJob, job_id)
+    if job is None or job.list_name != list_name or job.host != (host.name if host else "anonymous"):
+        raise HTTPException(404, detail={"errors": ["no such reclassification job"]})
+    return {"job_id": job.id, "list": job.list_name, "source": job.source_id, "sync_id": job.sync_id,
+            "status": job.status, "in_scope": job.total, "remaining": service.reclass_remaining(db, job.id),
+            "changed": job.changed, "failed_attempts": job.kept_after_error,
+            "created_at": job.created_at, "finished_at": job.finished_at}
+
+
+@app.delete("/v1/lists/{name}/sync/sessions/{session_id}")
+def sync_session_abort(name: str, session_id: int, request: Request, db: Annotated[Session, Depends(get_db)],
+                       host: Annotated[AllowedHost | None, Depends(host_auth)]):
+    """Abandon a session and discard its staged data. The list is not changed."""
+    return _sessions_call(sessions_mod.abort, db=db, list_name=_check_list(name), host=host.name if host else None,
+                          session_id=session_id, ip=request.client.host if request.client else None)
 
 
 @app.delete("/v1/lists/{name}/entries", dependencies=[Depends(require_api_key)])
@@ -213,15 +309,25 @@ def list_entries(
     if entry_status:
         q = q.where(Entry.status == entry_status)
     total = db.scalar(select(func.count()).select_from(q.subquery()))
-    rows = db.scalars(q.order_by(Entry.value).limit(limit).offset(offset))
-    shadows = compute_shadows(service.published_values(db, name)) if entry_status in (None, "active", "unverified") else {}
+    rows = list(db.scalars(q.order_by(Entry.value).limit(limit).offset(offset)))
+    owners: dict[int, list[dict]] = {}
+    for chunk in service._chunks([e.id for e in rows], 500):
+        for o in db.scalars(select(EntrySource).where(EntrySource.entry_id.in_(chunk)).order_by(EntrySource.id)):
+            owners.setdefault(o.entry_id, []).append(
+                {"kind": o.kind, "host": o.host, "source": o.source_id, "yaml_list": o.yaml_list,
+                 "added": o.created_at, "last_seen": o.last_seen_at, "last_sync_id": o.last_sync_id})
     return {
         "total": total,
         "entries": [
             {"value": e.value, "status": e.status, "detail": e.detail, "source": e.source,
              "created_at": e.created_at, "checked_at": e.checked_at,
-             "published": e.status in service.PUBLISHED and e.value not in shadows,
-             "shadowed_by": shadows.get(e.value)}
+             "enabled": e.enabled is not False,
+             "published": e.status in service.PUBLISHED and e.enabled is not False and not e.suppressed_by,
+             "shadowed_by": e.suppressed_by, "suppressed_by": e.suppressed_by,
+             "classification": {"method": e.class_method, "target": e.class_target, "result": e.class_result,
+                                "categories": e.class_categories.split(",") if e.class_categories else [],
+                                "status": e.class_status, "reason": e.detail, "at": e.checked_at},
+             "owners": owners.get(e.id, [])}
             for e in rows
         ],
     }

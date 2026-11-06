@@ -1,9 +1,22 @@
-# EDL Publisher — release 2.1.1
+# EDL Publisher — release 2.3.1
 
-**Version 2.1.1** (corrective release on 2.1.0): wildcard exclusion is now enforced even when Panorama
-classification is disabled; over-long URLs and source strings are rejected with HTTP 422; rate-limiter
-and login-failure tracking no longer grow without bound. See *Release notes 2.1.1* and
-*Upgrading from v2.1.0*.
+**Version 2.3.1** adds one optional safety field, `max_removals` (see *Release notes 2.3.1*).
+
+**Version 2.3.0** (extends 2.2.0; nothing was removed): chunked, resumable sync sessions for very large data sets
+(`/v1/lists/{name}/sync/sessions`), an optional `reclassify` flag on the sync API with persisted, resumable
+reclassification jobs, a background engine that keeps taking batches while classification work remains, and
+backlog / progress information in the admin interface. See *Chunked sync*, *Reclassification through sync*,
+*Background engine* and *Release notes 2.3.0*.
+
+**Version 2.2.0** (extends 2.1.1; nothing was removed): wildcard entries can be approved by classifying their
+apex domain (`apex-classification`, labelled *Classify Apex Domain*); importers can reconcile a whole data set
+with `POST /v1/lists/{name}/sync` (idempotent, multi-source ownership, dry run); approved wildcards suppress the
+subdomain entries they cover without deleting them; domain roots are stored and published with a trailing slash
+(`example.com/`); and the admin interface shows wildcard outcomes, sync history and entry details. See
+*Release notes 2.2.0* and *Upgrading from v2.1.1*.
+
+Earlier: 2.1.1 enforced wildcard exclusion independently of Panorama, rejected over-long URLs/sources with 422 and
+bounded the rate-limiter memory.
 
 FastAPI + Postgres service that accepts URLs from approved hosts, de-duplicates them, drops
 entries shadowed by a wildcard, excludes anything Panorama categorises as high risk, and
@@ -43,10 +56,12 @@ EDL name/endpoint, changing high-risk categories, turning off host authenticatio
 |---|---|
 | General | app name, description, timezone, log level, audit logging, audit retention |
 | Panorama Integration | mode (live/mock), host, port (443), API key (encrypted, masked, replace/clear), verify TLS, connection timeout, retry count, target, URL lookup command, Test connection |
-| URL Classification | enable, cache TTL, failure behaviour (fail-open/closed), available + high-risk categories, reclassification interval, unknown-category behaviour (publish/exclude), **wildcard policy** (exclude / apex-classification) |
+| URL Classification | enable, cache TTL, failure behaviour (fail-open/closed), available + high-risk categories, reclassification interval, unknown-category behaviour (publish/exclude), **wildcard policy** (*Exclude* / *Classify Apex Domain*; stored values `exclude` / `apex-classification`) |
 | EDL Configuration | enable publishing, name, description, additional endpoint (conflict-checked), max entries, empty behaviour (publish-empty / keep-previous / return-error), optional feed basic auth |
-| Processing | enable background processing, interval, batch size, concurrency (1-5, default 5), HTTP timeout, retries, retry delay; "Run now" / "Reclassify now" |
-| Security and API | host authentication, IP restrictions, token expiry, max submission size, rate limit, audit API submissions |
+| Processing | enable background processing, interval, batch size, concurrency (1-5, default 5), HTTP timeout, retries, retry delay, **sync classification budget**; "Run now" / "Reclassify now" |
+| Security and API | host authentication, IP restrictions, token expiry, max submission size, **max sync size**, rate limit, audit API submissions |
+
+Three pages under **Lists** in the sidebar (v2.2.0): **Entries** (search; ownership, classification method/target/categories/time, suppression and the suppressing wildcard, last sync), **Wildcards** (policy, per-wildcard outcome, *Recheck wildcard classifications* button) and **Sync** (each source's last sync time, id, status and counts of added / removed / unchanged / blocked / suppressed / pending / errors, plus previous reports with per-entry detail). None of them shows host tokens or encrypted secrets.
 
 Behaviour notes:
 
@@ -79,6 +94,13 @@ Host tokens are **not** accepted here.
 | POST | `/v1/admin/panorama/test-connection` | test saved settings, or unsaved overrides `{"host","port","api_key","verify_tls","connect_timeout","mode"}`; 200 ok / 502 failed |
 | GET | `/v1/admin/audit?kind=admin\|api&limit=&offset=` | audit records |
 | GET | `/v1/admin/edl` | per list: published vs currently eligible entries, retained / failed-rebuild state |
+| GET | `/v1/admin/wildcards?list=&limit=&offset=` | stored wildcards with apex target, result, categories, time, status and how many entries each suppresses; the active policy |
+| POST | `/v1/admin/wildcards/recheck` | re-classify wildcards: `{"list": null, "refresh": true}` (apex domains de-duplicated, at most 5 requests in flight, nothing deleted) |
+| GET | `/v1/admin/sync/sources` | each importer (list, host, source) and its latest sync outcome and counts |
+| GET | `/v1/admin/sync/runs?list=&source=&limit=&offset=` | sync history |
+| GET | `/v1/admin/sync/runs/{id}` | one stored sync report, with per-entry detail (capped) |
+| GET | `/v1/admin/entries?list=&status=&q=&suppressed=&wildcard=` | entries with owners, classification and suppression details |
+| POST | `/v1/admin/entries/enabled` | `{"list","values":[...],"enabled":false}`: keep an entry but never publish it |
 
 `PUT` returns `422 {"detail":{"errors":[...]}}` for invalid values and `409` with
 `requires_confirmation` for disruptive changes; repeat with `"confirm": true` to apply.
@@ -105,18 +127,27 @@ Populate a list (per-host credentials):
 Per-URL status: `added`, `duplicate`, `blocked`, `pending`, `invalid` (plus `published` /
 `shadowed_by`). Errors: `401` bad/expired token, `403` wrong address or list, `413`, `429`.
 
+Reconcile a whole data set from one source (see *Source sync* below):
+
+    curl -H "Authorization: Bearer $HOST_TOKEN" -H 'Content-Type: application/json' \
+      -d '{"source":"yaml-import","sync_id":"2026-11-06-001","delete_missing":true,"dry_run":false,
+           "entries":["example.com","*.example.com",{"url":"tools.example.net/login","yaml_list":"tools"}]}' \
+      https://edl.example.net/v1/lists/default/sync
+
 Management calls (`X-API-Key`): `GET/DELETE /v1/lists/{name}/entries`,
 `POST /v1/lists/{name}/recheck`. Feed: `GET /edl/{name}` (ETag / 304 supported). Health:
-`GET /healthz`.
+`GET /healthz`. `GET /v1/lists/{name}/entries` now also returns `enabled`, `suppressed_by`, `classification`
+(method, target, result, categories, status, reason, time) and `owners` for each entry (`shadowed_by` is kept).
 
 ## Behaviour
 
-- **Normalisation**: lowercased; scheme, credentials, port, query, fragment, trailing slash
-  removed. Only a leading `*.` wildcard is accepted, and it must not target a public suffix
-  (see *Public Suffix List* below).
+- **Normalisation** (server side, authoritative, applied before validation, de-duplication, storage,
+  classification, shadowing, sync comparison and feed generation): lowercased; scheme, credentials, port,
+  query and fragment removed; domain roots end in a slash (see *URL normalisation*). Only a leading `*.`
+  wildcard is accepted, and it must not target a public suffix (see *Public Suffix List* below).
 - **De-duplication** on the normalised value, per list.
-- **Shadowing** is computed at render time: `*.example.com` shadows `a.example.com` and
-  `a.b.example.com`; `example.com` and `*.example.com` never shadow each other.
+- **Shadowing / suppression**: an *approved* wildcard suppresses the entries it covers (see *Wildcard
+  suppression*); `example.com/` and `*.example.com/` never shadow each other.
 - **Classification**: entries are looked up on Panorama, cached for the TTL, and compared with
   the high-risk set. Wildcards are governed by the wildcard policy (see *Wildcard entries*). Statuses: `active`, `blocked`, `pending`
   (fail-closed, held back), `unverified` (fail-open, published, re-checked later). A re-check
@@ -129,8 +160,11 @@ Management calls (`X-API-Key`): `GET/DELETE /v1/lists/{name}/entries`,
 ## Database migrations
 
 No Alembic. At startup `migrations.run_migrations` runs `create_all` (adds missing tables) and
-applies additive `ALTER TABLE ... ADD COLUMN` steps: `allowed_hosts.expires_at` (v2.0.0) and
-`edl_snapshots.retained`, `edl_snapshots.note` (v2.1.0), all nullable. Existing data and existing settings are
+applies additive `ALTER TABLE ... ADD COLUMN` steps: `allowed_hosts.expires_at` (v2.0.0),
+`edl_snapshots.retained`, `edl_snapshots.note` (v2.1.0) and, in v2.2.0, `entries.enabled`, `entries.suppressed_by`,
+`entries.class_method`, `entries.class_target`, `entries.class_result`, `entries.class_categories`,
+`entries.class_status`, all nullable. v2.2.0 also creates the tables `entry_sources`, `sync_sources` and `sync_runs`
+and runs one idempotent data upgrade in a single transaction (see *Upgrading from v2.1.1*). Existing data and existing settings are
 preserved; only missing settings are seeded. Secrets stored by v1 (encrypted with a key derived
 from `SECRET_KEY`) are still readable and are re-encrypted with `ENCRYPTION_KEY` on first start.
 Back up the database before upgrading anyway.
@@ -187,22 +221,284 @@ treats an apex classification as proof about subdomains.
 
 Setting *URL Classification > Wildcard entries* (`wildcard_classification_policy`):
 
-| Policy | Behaviour |
+| Policy (UI label) | Stored value | Behaviour |
+|---|---|---|
+| **Exclude** (**default for new installs**) | `exclude` | Wildcard entries are kept but never published. They are stored as `blocked` with the reason "wildcard excluded by policy" (classification status `excluded`); no Panorama lookup is made for them. |
+| **Classify Apex Domain** | `apex-classification` | The wildcard is reduced to its apex (`*.example.com/` -> `example.com`, `*.sub.example.com/` -> `sub.example.com`), which is submitted to Panorama. **The literal wildcard is never submitted.** Clean and not high-risk -> approved (published, and it then suppresses the subdomains it covers). High-risk category -> blocked. Panorama unavailable, timing out, returning an unparseable answer or an *unknown* category -> **pending** (not published) whatever the failure and unknown-category settings say: an inconclusive result is never approval. |
+
+An existing installation keeps the policy it has stored; only a missing setting is seeded with `exclude`.
+
+**Apex classification is an explicit policy decision, not evidence.** Classifying `example.com` does **not**
+prove that every subdomain is safe: Panorama categorises individual URLs, and `example.com` can be clean
+while `a.example.com` hosts malware, or while a subdomain created tomorrow does. Choose *Classify Apex
+Domain* only if you accept that risk; every place that shows such a wildcard says its subdomains are not
+verified. A wildcard approved on its apex also suppresses (see below) a subdomain entry that was individually
+blocked, so the individually blocked subdomain disappears from the feed only because the wildcard already
+covers it - it is **not** being protected by that block. Keep that in mind before approving a wildcard whose
+subdomains you have reason to distrust.
+
+**Metadata stored on every classified entry** (admin *Entries* page, `GET /v1/lists/{name}/entries`,
+`GET /v1/admin/entries`): the original entry (for a wildcard, the wildcard itself), `class_target` (what was
+actually submitted - the apex), `class_method` (`url` or `wildcard_apex`), `class_result`
+(`clean` / `blocked` / `unknown` / `error` / `excluded` / `not_classified`), `class_categories`, `class_status`
+(`approved` / `blocked` / `pending` / `excluded` / `unverified`), the reason (`detail`) and the time of the last
+attempt (`checked_at`). Wildcards stored by v2.1.1 have no metadata until they are next classified (run
+*Recheck wildcard classifications*).
+
+**Efficiency.** Identical apex domains are looked up once (a thousand `*.example.com/...` entries cost one
+request), cached answers are reused for the cache TTL (including answers cached for the same host by an
+ordinary `example.com/` entry), and every lookup goes through the process-wide limit of 5 concurrent
+Panorama requests.
+
+**Changing the policy** takes effect immediately for stored entries and requires confirmation. Nothing is
+deleted: `exclude` -> `apex-classification` releases excluded wildcards to *pending* and the background engine
+classifies their apex domains; `apex-classification` -> `exclude` re-statuses published and pending wildcards to
+`blocked`/`excluded` and the subdomains they suppressed return to the feed. Wildcards blocked on a high-risk
+apex stay blocked until the next recheck. *Wildcards > Recheck wildcard classifications* (or
+`POST /v1/admin/wildcards/recheck`) re-evaluates every wildcard, including blocked ones, ignoring the cache. If
+Panorama is unreachable during a recheck, wildcards that were already classified keep their status.
+
+**Wildcards and Panorama availability.** Under `apex-classification`, a wildcard needs a successful apex
+classification to be published. With classification **disabled**, a wildcard stays *pending* (a warning is
+shown on the Overview page); v2.1.1 published it. With policy `exclude` a wildcard is never published, with
+classification enabled or not.
+
+## Wildcard suppression
+
+Matching is on whole domain labels: for each entry the matcher looks up its own label suffixes
+(`a.b.example.com/` -> `*.b.example.com/`, `*.example.com/`, ...) in the set of approved wildcards, so it is
+exact and costs O(entries x labels) - no pairwise comparison, which matters at 60,000 entries.
+
+| Approved wildcard | Suppresses | Does not suppress |
+|---|---|---|
+| `*.example.com/` | `www.example.com/`, `mail.example.com/`, `a.b.example.com/`, `www.example.com/anything` | `example.com/`, `example.com.au/`, `example.com.evil.net/`, `notexample.com/` |
+| `*.sub.example.com/` | `www.sub.example.com/` | `www.example.com/`, `sub.example.com/` |
+| `*.example.com/login` | `a.example.com/login` | `a.example.com/other`, `a.example.com/login/` |
+
+- Only **approved** wildcards suppress. A pending, failed, excluded, blocked or disabled wildcard does not.
+- Suppression is within one list.
+- A suppressed row is **never deleted**. It keeps its owners and records the wildcard in `suppressed_by`
+  (shown in the admin UI and API). When the wildcard is removed, blocked, disabled or goes back to pending, the
+  row is released automatically and published again **subject to its own classification**.
+
+## URL normalisation
+
+| Input | Canonical value |
 |---|---|
-| `exclude` (**default**, conservative) | Wildcard entries are never published. They are stored as `blocked` with the reason "wildcard excluded by policy"; no Panorama lookup is made for them. |
-| `apex-classification` | Only the base domain is classified (`*.example.com` -> `example.com`). If it is clean and not high-risk, the wildcard is published, and its entry detail says "only the base domain was classified; the category of subdomains is NOT verified". Use only if you accept that risk. |
+| `example.com`, `https://example.com`, `http://example.com`, `example.com/` | `example.com/` |
+| `www.example.com` | `www.example.com/` |
+| `*.example.com` | `*.example.com/` |
+| `example.com/login` | `example.com/login` |
+| `example.com/login/` | `example.com/login/` |
+| `https://Example.com/login?next=/x#top` | `example.com/login` |
 
-Ordinary hosts and URLs (`www.example.com`, `example.com/path`) are classified exactly as before,
-and `example.com` and `*.example.com` can both be listed. Changing the policy takes effect
-immediately for stored entries (rows are re-statused, nothing is deleted) and requires
-confirmation.
+Domain roots always get the slash; path-specific entries are **not** given one, and an existing trailing slash
+on a path is kept, so `example.com/login` and `example.com/login/` are different entries (they are not treated
+as identical automatically). Query strings and fragments are still stripped, as before, so
+`example.com/a?x=1` and `example.com/a` are the same entry. Panorama is asked about the host
+(`example.com`) or the path (`example.com/login/`), never about the slash-only form of a root.
 
-**Wildcard exclusion does not depend on Panorama.** It is a publishing policy, enforced whether or not
-classification is enabled, for new submissions, for rechecks/reclassification, and when the policy is
-changed. With policy `exclude`, a wildcard can never become `active`/`unverified`, so it is never in an
-EDL snapshot, even with classification switched off (in v2.1.0 it could be; fixed in 2.1.1). With
-classification disabled, ordinary hosts and URLs are still all published without any Panorama query, and
-under `apex-classification` wildcards are published too (nothing is classified, and the entry says so).
+## Source sync (`POST /v1/lists/{name}/sync`)
+
+The importer describes the **desired state** of one *source*; the server computes the changes. A source is the
+pair (authenticated host, `source` string); ownership, removals and history are per source.
+
+    {"source": "yaml-import", "sync_id": "2026-11-06-001", "delete_missing": true, "dry_run": false,
+     "entries": ["example.com", {"url": "*.example.com", "yaml_list": "partners"}]}
+
+| Field | Meaning |
+|---|---|
+| `source` | 1-100 characters; `host:source` must fit 128 characters. |
+| `sync_id` | 1-128 characters `[A-Za-z0-9._:@/+=-]`, unique per run. A repeated, already-applied `sync_id` returns the stored report (`"duplicate": true`) and does nothing; the same id with different content is `409`. |
+| `entries` | strings, or `{"url", "yaml_list"}` (the importer's list name, tracked per entry). At most `max_sync_size`. |
+| `delete_missing` | remove entries this source owns that are no longer listed. Default `false`: nothing is ever removed. |
+| `confirm_empty` | required, with `delete_missing`, when `entries` is empty. |
+| `max_removals` | optional integer >= 0 (2.3.1). A server-side ceiling on how many entries this commit may remove from this source. See *Removal limit* below. Ignored without `delete_missing`; not part of the `sync_id` fingerprint. |
+| `dry_run` | validate and report; **no** database, feed, audit or Panorama activity. |
+| `verbose` | include unchanged entries in the per-entry detail. |
+
+Authentication is the host's bearer token plus its list permission and IP restriction, exactly as for
+`/entries` (the management API key is not accepted). Pipeline: authenticate -> authorise list -> validate and
+normalise -> identify owned entries -> compute add / remove / unchanged -> find entries needing
+(re)classification -> classify (cache first, bounded live lookups) -> apex classification of wildcards ->
+suppression -> one transaction that writes entries and ownership, recomputes suppression, replaces the feed
+snapshot, records the run and the audit trail -> report. A failure at any stage rolls the whole thing back;
+the database and the published feed are exactly as before.
+
+**Safety rules (enforced, tested):**
+
+- Only entries owned by *this host and source* are ever removed, and only with `delete_missing=true`. Entries
+  of other sources or hosts and entries from `POST .../entries` (owners of kind `api`) are never removed by a
+  sync; a sync adds itself as an additional owner, and an entry is deleted only when its **last** owner lets go.
+- `delete_missing` with any **invalid** entry in the request is refused (`422`, nothing changed): a damaged
+  import never deletes. Without `delete_missing`, invalid entries are reported and the valid ones applied.
+- An empty `entries` with `delete_missing` needs `confirm_empty=true`.
+- **Removal limit (`max_removals`, 2.3.1).** The limit is checked twice by the server: once on the plan made before
+  classification (a cheap early refusal) and once, authoritatively, on a plan re-read inside the apply transaction
+  while holding the list lock and the snapshot lock. If more entries would be removed than `max_removals`, the
+  request is refused with `409` and `{"removal_limit_exceeded": true, "would_remove": N, "max_removals": M}`;
+  nothing is written. The limit therefore applies to the state of the list at commit time, not to an earlier
+  dry run: a stale preview cannot authorise a larger deletion, and two racing syncs of one source are serialised so
+  each is measured against the list as the other left it. A refused `sync_id` is not consumed and may be retried with a higher
+  limit. A `dry_run` never refuses: it reports `max_removals` and `would_exceed_max_removals`. The count is the number
+  of ownerships this source gives up (`counts.removed`), which is what the importer shows. Not covered: a limit
+  does not bound removals made by a *different* source or host, and it is not a rate limit across successive syncs.
+- If classification **fails** during a run (Panorama errors), removals are *deferred*: new entries are stored
+  as `pending` (never published), the report says `removals_deferred`, and repeating the sync once Panorama is
+  back applies them.
+- A Panorama outage, timeout or inconclusive answer is never approval. Unclassified wildcards are never
+  published when the policy requires classification.
+- Classification budget: one request makes at most `sync_classification_budget` (default 2000) distinct live
+  Panorama lookups, for entries **new** to the list. The rest are stored `pending` and the background engine
+  classifies them (reported as `queued_for_background`), so a first import of tens of thousands of entries
+  cannot hold a request open for hours. Existing pending entries are only completed from the cache by a sync;
+  retrying them is the engine's job, which is also why repeating an identical sync sends nothing to Panorama.
+- Syncs of one list (and legacy submissions to it) are serialised by a per-list lock.
+
+**Idempotency.** Repeating an identical sync with a new `sync_id` changes no entry, ownership or snapshot row,
+sends nothing to Panorama and does not regenerate the feed (status `no_change`); only the run record,
+source status and audit record are written. The per-entry `last_seen_at` / `last_sync_id` on an ownership row
+are updated when that row is created or changed, not on every confirming sync; the source-level last sync is in
+`sync_sources`.
+
+**Report** (also stored, see the *Sync* page): `counts` with `total_desired`, `existing`, `new`, `unchanged`,
+`ownership_added`, `yaml_list_changed`, `removed`, `entries_deleted`, `kept_other_owners`, `missing_not_removed`,
+`blocked_by_policy`, `blocked_by_classification`, `pending_classification`, `queued_for_background`,
+`approved_by_apex_classification`, `suppressed_by_shadowing`, `requiring_reclassification`, `invalid`,
+`processing_errors`, `live_lookups`, `published_of_desired`; `feed` (entries before / after, added, removed);
+`entries` (per entry: action, status, published, suppressed_by, reason, classification and its source - capped
+at 2000, with `entries_truncated`); `invalid`; `warning`. HTTP: `200`, `401/403`, `409` (sync_id reuse with
+different content, or a conflicting concurrent change - retry), `413`, `422`, `429`, `500` (rolled back,
+retry with the same `sync_id`), `503` (another sync of the list is still running).
+
+**Dry run.** `dry_run=true` computes additions, removals, duplicates, suppression, classification changes and
+the proposed effective feed (`feed.entries_after` ...) without writing. It never contacts Panorama: each entry
+that needs classification is reported as `cached` (projected from the cache), `requires_live` (would be
+looked up; projected as pending) or `not_required`; `classification_needed` totals them.
+
+**Rollback** is a sync of the previous desired state with a new `sync_id`
+(`delete_missing=true`): the importer's data set is the source of truth, so keep it in version control.
+Entries removed in error are recreated and re-classified (from the cache when still fresh).
+
+Example workflow:
+
+    # 1. preview
+    curl ... -d '{"source":"yaml-import","sync_id":"2026-11-06-001","entries":[...],"delete_missing":true,"dry_run":true}'
+    # 2. apply (same body, dry_run false; the same sync_id is fine for the real run)
+    curl ... -d '{"source":"yaml-import","sync_id":"2026-11-06-001","entries":[...],"delete_missing":true}'
+    # 3. a lost response? repeat step 2 verbatim: you get the stored report, nothing is applied twice
+    # 4. roll back: send the previous entries with sync_id "2026-11-06-002-rollback"
+
+## Chunked sync (`/v1/lists/{name}/sync/sessions`)
+
+`POST .../sync` takes the whole desired state in one request, up to `max_sync_size` entries (default 250,000).
+For large data sets, and for clients that must survive interruptions, the same operation is available as a
+**session**. A session stages the desired state chunk by chunk; **nothing** in the list, ownership, feed or
+audit trail changes until an explicit **commit**, which runs the ordinary sync pipeline (validation, planning,
+classification, one atomic transaction, report, `sync_id` idempotency, all safety rules above).
+
+| Call | Purpose |
+|---|---|
+| `POST /v1/lists/{name}/sync/sessions` | Start or resume. Body: `source`, `sync_id`, `delete_missing`, `confirm_empty`, `reclassify` (all optional except the first two). Returns `session_id`, `received_ranges`, `received_invalid`, `max_chunk_size`, `recommended_chunk_size`, `resumed`. If the `sync_id` was already applied: `{"status": "already_applied", "run_id": ...}` and nothing to upload. Repeating the call with the same `sync_id` and options returns the open session (`resumed: true`); other options for the same `sync_id` are `409`. |
+| `GET .../sessions/{id}` | Progress: which chunk ranges arrived, entry and invalid counts, status (`receiving`, `committed`, `aborted`, `expired`). |
+| `PUT .../sessions/{id}/chunks/{index}` | Stage one chunk, body `{"entries": [...]}` (strings or `{url, yaml_list}`), at most `sync_max_chunk_size` entries (`413` above). **Idempotent**: re-sending an identical chunk returns `already_received: true`; a *different* chunk with the same index is `409`. Each entry is validated and canonicalised on arrival; the reply gives `invalid_in_chunk` and the session total `received_invalid`. Chunks may arrive in any order and in parallel. |
+| `GET .../sessions/{id}/invalid?offset=&limit=` | Every rejected entry of the session with its `chunk`, `position` in that chunk and `reason` (the commit reply itself lists only the first 100, with `invalid_total`). |
+| `POST .../sessions/{id}/commit` | Body: `total_chunks`, `total_entries`, `dry_run`, `verbose`, `max_removals` (optional, 2.3.1; a refusal keeps the session open so the commit can be retried with a different limit). Refused with `409` and `nothing_applied: true` unless chunks `0..total_chunks-1` all arrived and their entry count equals `total_entries`. Otherwise returns the normal sync report (plus `session`). Repeating a successful commit returns the stored report. `dry_run` leaves the session open. |
+| `DELETE .../sessions/{id}` | Abandon: staged data is discarded; the list is untouched. |
+
+**Safety properties (tested):**
+
+- A partial upload is never a desired state: no commit, no change. Deletions happen only inside the commit
+  transaction, only for entries owned by this host and source, and only with `delete_missing`.
+- Sessions and staged entries live in the database, so an interrupted upload (importer crash, network failure,
+  **server restart**) resumes exactly where it stopped; a session idle for `sync_session_ttl_minutes` (default 24 h)
+  expires and its staged data is discarded without touching the list.
+- A lost reply is harmless: repeat the request. A crash between the server applying the commit and the client
+  hearing about it is recovered by repeating the commit (or the session start): the stored result is returned,
+  never a second application.
+- One open session per (list, host, source); a second `sync_id` for the same source is `409` until the first is
+  finished or deleted. A session belongs to the host that created it (other hosts get `404`).
+- Concurrency: commits of one list are serialised by the per-list lock; `sync_max_concurrent_commits` (default 2)
+  bounds simultaneous commit stages across lists (`503` when the wait exceeds five minutes: retry); two
+  simultaneous commits of one session apply it once.
+- Memory: a request carries one chunk. The commit stage holds the canonical desired state (values only) in memory.
+- With `delete_missing`, any invalid entry makes the commit `422` (nothing changed); without it the valid entries
+  are applied and the invalid ones reported.
+
+Settings: *Maximum sync size*, *Largest accepted chunk* (`sync_max_chunk_size`, 25,000), *Sync chunk size*
+(`sync_chunk_size`, 10,000), *Chunked sync idle timeout* (`sync_session_ttl_minutes`), *Concurrent sync commits*.
+
+## Reclassification through sync (`reclassify`)
+
+`reclassify` (default `false`) is accepted by `POST .../sync` and by session start. It applies to the entries of
+**this desired state that already exist** in the list (including entries also owned by other sources; ownership
+is never touched). Without it, existing valid classifications are preserved and an identical sync sends nothing
+to Panorama.
+
+When `true`:
+
+1. Panorama is asked again for each distinct classification target (identical apex domains once). The cache is
+   **bypassed and refreshed** with the new answers.
+2. At most `sync_classification_budget` distinct targets are looked up inside the request (entries new to the list
+   first); the lookups obey the process-wide limit of **5** concurrent Panorama requests.
+3. The remaining entries, and entries whose lookup failed, are flagged with a **reclassification job** stored in the
+   database (`reclass_jobs`, `entries.reclass_job_id`). They keep their current status and stay published or
+   unpublished exactly as before until the background engine obtains a conclusive answer. A restart or crash
+   resumes the job; `GET /v1/lists/{name}/sync/reclassifications/{job_id}` (host token) returns `status`
+   (`running` / `done`), `in_scope`, `remaining`, `changed`, `failed_attempts`.
+4. Outcomes are applied with the normal status rules, so a previously **blocked** entry whose category is no longer
+   high risk is released, an approved entry that is now high risk is blocked, wildcards follow the wildcard policy,
+   and **suppression and the published snapshot are recomputed** in the same transaction (inline part) or by the
+   engine after each batch.
+5. **Fail closed.** A timeout, error or unparsable answer changes nothing about the entry (no approval, no
+   demotion) and leaves the flag set for a retry. An `unknown` answer never releases an entry that was blocked by a
+   category. If any lookup fails, removals of that run are deferred, as for new entries.
+
+The report gains `reclassification`: `requested`, `job_id`, `in_scope`, `reclassified_inline`, `changed_inline`,
+`kept_after_error`, `inconclusive_kept`, `queued_for_engine`, `remaining`, `status`. A dry run reports
+`in_scope` and `panorama_lookups_needed` and contacts nothing. `reclassify` is part of the request fingerprint:
+the same `sync_id` with another value is `409`.
+
+## Background engine
+
+Every *processing interval* the engine (1) retries pending / unverified entries, (2) works on reclassification jobs
+and (3) runs the scheduled full reclassification. **A cycle no longer stops after one batch**: while eligible work
+remains it takes the next batch of *Maximum batch size* entries after *Delay between batches*
+(`processing_batch_delay_seconds`, default 1 s), and only then waits for the next interval. Eligible means not
+yet attempted in this cycle, so each entry is tried once per cycle (the existing retry rounds and backoff within a
+batch are unchanged) and an outage cannot spin the loop; a batch in which every lookup fails ends the cycle ("Panorama
+appears unavailable") and is retried at the next interval. Batch size, delay and the on/off switch are read before
+every batch. Panorama concurrency stays capped at 5 inside the classifier whatever the batch size. On shutdown no new
+batch starts, the batch in progress finishes and is committed, then the engine stops. Admin > Processing shows the
+pending backlog, entries awaiting reclassification, the engine state and batch counters, the last cycle and the
+latest reclassification jobs; the Overview shows the backlog too. Manual *Run processing now* is still a single batch.
+
+**Failure behaviour (reviewed and tested in 2.3.1).** Within one lookup the Panorama client retries network errors and
+HTTP 5xx with exponential backoff (0.5 s, 1 s, 2 s, ... capped at 5 s, *Panorama retry count* times, default 2);
+API errors and unparsable replies are never retried. A batch then makes `retry_attempts` extra rounds (default 2,
+`retry_delay_seconds` apart, default 10 s) for the entries that failed. An entry that still fails stays *pending*
+(never approved on an error, timeout or inconclusive answer) and is tried again **at most once per cycle**, i.e. once
+per processing interval (default 60 s, minimum 5 s); a batch in which every lookup failed ends the cycle. The loop is
+woken early only by saving settings, never by failures or syncs. There is no escalating per-entry back-off across
+cycles: an entry Panorama can never answer is re-tried every interval (one request per cycle, plus the rounds above)
+until it is removed or answered.
+
+## Entry states in the admin interface
+
+Admin > Overview (*Entries by state*), Admin > Processing and `GET /v1/admin/edl` (keys `entries`, `processing`)
+report, per list: **Uploaded** (every stored entry), **Approved** (status active), **Blocked**, **Pending** (the
+classification backlog, never published), **Unverified** (fail-open, published and re-checked), **Suppressed**
+(approved entries hidden by an approved wildcard; a subset of Approved), **Disabled** (switched off by an
+administrator) and **Published** (lines in the feed being served). Uploaded = Approved + Blocked + Pending +
+Unverified. The *Entries* page filters by the same states.
+## Stored entries versus the effective published EDL
+
+The database stores **source entries** (everything every source and `POST .../entries` asked for, with ownership,
+classification and suppression). The feed firewalls fetch contains only the **effective** entries: validated,
+approved (`active`, or `unverified` under fail-open), `enabled`, **not suppressed** by an approved wildcard,
+within `edl_max_entries` (oldest kept), de-duplicated and sorted, one per line, with canonical slashes. Identical
+data always produces identical bytes and the same ETag; the stored snapshot is only replaced when the effective
+output changes (`Last-Modified` and ETag do not move otherwise).
 
 ## Panorama concurrency
 
@@ -211,6 +507,32 @@ concurrent requests* defaults to **5** and cannot be set higher (the API and UI 
 values; an older stored or environment value above 5 is clamped to 5 on upgrade). The limit is
 enforced inside the Panorama client, process-wide, so it holds across API submissions, background
 processing, rechecks and connection tests running at the same time. Lower values (1-4) work too.
+
+**There is no request-rate limit towards Panorama** - only this concurrency cap. The "120 requests per minute"
+default (*Rate limit*, `rate_limit_requests` / `rate_limit_interval_seconds`) is an **inbound** limit: how many
+requests one *host* may send to this application (a sliding window per host name, shared by every host endpoint -
+entries, sync, session start/chunk/status/invalid/commit/abort, reclassification status; `0` disables it). It is
+unrelated to Panorama's load and does not slow classification. It does bound an importer: each chunk upload is one
+request, so a 64,000-entry import in chunks of 10,000 needs about 15 requests, but 100,000 entries in chunks of 500
+needs over 200 and the importer will be answered `429` and wait for `Retry-After` (it retries `429`). Raise the limit
+or the chunk size for bulk imports. Not covered: the public feed endpoints and the admin API are not counted, and
+the window is per process (one worker).
+
+**Estimated classification time (an estimate, not a measurement).** Nothing here was measured against a real
+Panorama; the tests use a mock that answers instantly. If every entry needs its own Panorama lookup (nothing cached,
+no duplicates), the background time is about `entries x lookup latency / 5` plus `batches x delay between batches`
+(batches = entries / *Maximum batch size*; with the defaults 500 and 1 s that is about 2 s per 1,000 entries). The
+first *Sync classification budget* (2,000) entries are done inside the sync request. Cached answers (24 h by default)
+and repeated entries cost nothing; failures add the retry rounds described above.
+
+| Entries to look up | latency 0.2 s | 0.5 s | 1 s | 2 s |
+|---|---|---|---|---|
+| 62,000 (a 64,000-entry first import) | about 43 min | about 1.8 h | about 3.5 h | about 6.9 h |
+| 98,000 (a 100,000-entry first import) | about 1.1 h | about 2.8 h | about 5.5 h | about 10.9 h |
+
+Measure the latency of your Panorama (Admin > Panorama > Test connection shows one) before planning a bulk load;
+until a list is classified its pending entries are not published. *Reclassify all entries* costs the same per entry.
+Repeat imports of unchanged lists make no lookups.
 
 ## Panorama response parsing
 
@@ -320,6 +642,7 @@ whether the last rebuild failed.
 | Raw URL string in a request | 65,536 characters | HTTP 422 (schema). |
 | Source (`<host name>:<source>`) | 128 characters | HTTP 422 if the final combined string is longer (host names are up to 64 characters, the supplied `source` up to 100). Never truncated; nothing stored. |
 | URLs per request | `max_submission_size` setting | HTTP 413. |
+| Entries per sync request | `max_sync_size` setting (default 100,000) | HTTP 413. Invalid sync entries are reported per entry; over-long ones (>2048 after normalisation) are `invalid`, never truncated. |
 
 The length is measured on the normalised value, so a long query string or fragment that normalisation
 strips does not count. Other invalid entries (malformed host, wildcard over a public suffix ...) are still
@@ -337,6 +660,72 @@ bounded at 50,000 live sources (least recently active are dropped beyond that), 
 tracked per /64 so one subscriber cannot create unlimited identities. Remaining limits: state is per
 process and lost on restart (run one worker), and it only sees the address uvicorn reports (see
 *Production authentication recommendations*).
+
+## Release notes 2.3.1
+
+- **New (optional):** `max_removals` on the sync API and on the session commit: a server-enforced removal limit,
+  evaluated inside the commit transaction (`409 removal_limit_exceeded`, nothing applied). Importer 2.1.1 sends it
+  when `--max-removals` is given and the server's schema defines it.
+- **Tests:** `tests/test_v231_removal_safety.py` (limit, stale preview, rollback, racing syncs, dry runs change no row),
+  `tests/test_v231_throughput.py` (inbound rate limit, cache use, backoff, engine retries, admin breakdown) and the
+  opt-in PostgreSQL 16 suite `tests/test_postgres.py`.
+- **New (admin):** *Entries by state* (uploaded, approved, blocked, pending, unverified, suppressed, disabled,
+  published) on the Overview and Processing pages and in `GET /v1/admin/edl` (additive keys `entries`, `processing`).
+- **Documentation:** the 120 requests/minute default is the inbound per-host limit, not a Panorama limit; estimated
+  classification times and the failure/back-off behaviour are documented under *Panorama concurrency* and *Background engine*.
+- No schema change, no new settings, no dependency changes. Roll back by restoring 2.3.0; its API ignores the field and the importer then falls back to its own preview check.
+
+## Release notes 2.3.0
+
+- **New:** chunked sync sessions (staging, idempotent chunks, explicit commit, persistent and restart-safe);
+  chunk-level validation with `invalid_in_chunk` and `GET .../invalid`.
+- **New:** `reclassify` on the sync API and session start, with persisted reclassification jobs and
+  `GET /v1/lists/{name}/sync/reclassifications/{job_id}`.
+- **Changed:** the background engine drains the backlog batch after batch instead of one batch per interval.
+- **New settings:** `processing_batch_delay_seconds`, `sync_chunk_size`, `sync_max_chunk_size`,
+  `sync_session_ttl_minutes`, `sync_max_concurrent_commits`.
+- **Schema (additive, automatic):** tables `sync_sessions`, `sync_chunks`, `sync_staged`, `reclass_jobs`; column
+  `entries.reclass_job_id` (indexed). No dependency or environment variable changes. Upgrade from 2.2.0: replace the
+  image/files and restart; roll back by restoring the previous version (the new tables and column are ignored by 2.2.0).
+
+## Release notes 2.2.0
+
+- **New:** wildcard classification through the apex domain (policy *Classify Apex Domain*), with metadata, caching,
+  de-duplicated lookups under the 5-request limit, fail-closed handling and an admin recheck.
+- **New:** `POST /v1/lists/{name}/sync` - idempotent, multi-source reconciliation with dry run, `sync_id` recovery,
+  atomic apply, audit and reports; tables `entry_sources`, `sync_sources`, `sync_runs`.
+- **New:** persistent wildcard suppression (`entries.suppressed_by`); only approved wildcards suppress; nothing deleted.
+- **Changed:** canonical entries for domain roots end in `/` (`example.com/`). The **published feed changes**
+  (every root line gains a slash) and the ETag changes once at the first start. Path entries keep their form.
+- **Changed (behaviour):** under `apex-classification` with classification disabled, wildcards are *pending*
+  (v2.1.1 published them); under `apex-classification`, a wildcard whose apex lookup fails or is inconclusive is
+  *pending* even in fail-open mode (previously `unverified`, i.e. published).
+- **Changed:** wildcard apex lookups submit the apex host only (v2.1.1 also appended a path for `*.example.com/path`).
+- **Fixed:** Panorama answers for URLs with a trailing slash on the path were not recognised.
+- **New settings:** `max_sync_size`, `sync_classification_budget`. New admin pages and endpoints (see above).
+- No new dependencies or environment variables.
+
+## Upgrading from v2.1.1
+
+1. Back up the database (and keep your `ENCRYPTION_KEY`). No new environment variables or dependencies.
+2. `docker compose up -d --build`. At first start the app, in one transaction: adds the new `entries` columns and the
+   three new tables; sets `entries.enabled`; appends `/` to every **domain-root** entry (`example.com` ->
+   `example.com/`, `*.example.com` -> `*.example.com/`; path entries such as `example.com/login` are not rewritten;
+   a root that already has a slashed twin is merged keeping the more restrictive status and all owners); records an
+   `api` owner for each existing entry (host and note taken from its source string, `legacy` when none); writes a
+   `schema-upgrade` audit record; then recomputes suppression and rebuilds every feed. Statuses, reasons, cached
+   classifications, hosts, tokens, settings, audit history and list configuration are untouched.
+3. **Expect the feed to change once:** every root line gains a slash, and the ETag changes. This is the form
+   v2.2.0 is specified to publish; it has not been tested against a firewall here, so confirm on a test firewall
+   how your PAN-OS version matches `example.com/` before production. The previous snapshots are replaced by the
+   rebuilt ones.
+4. The wildcard policy you had stored is kept. If it is `apex-classification` with classification disabled,
+   wildcards become *pending* and leave the feed (a warning explains it). Wildcards stored by v2.1.1 have no
+   classification metadata until *Recheck wildcard classifications* is run.
+5. Check `docker compose logs app` (`schema:` lines), `/healthz` (`"version":"2.2.0"`), the Overview page, then
+   *Wildcards*, *Sync* and *Entries*. Run a `dry_run` sync from your importer before the first real one.
+6. Rollback: restore the backup. (v2.1.1 would otherwise read the new database, but it would not understand the
+   trailing slashes in `entries.value` or the new columns/tables, so do not run it on a migrated database.)
 
 ## Release notes 2.1.1
 
@@ -400,10 +789,36 @@ vary by PAN-OS version; the connection test uses `show system info`. Verify both
   background loop are per process.
 - Host checks are by IP/CIDR, not DNS name.
 - Disruptive-change confirmations are held in memory for a few minutes (lost on restart).
-- Wildcard subdomains cannot be classified (see above); `apex-classification` is an accepted-risk option.
+- Wildcard subdomains cannot be classified (see above); `apex-classification` is an accepted-risk option, and an approved wildcard also covers an individually blocked subdomain in the same list.
+- A sync request is synchronous: live classification per request is bounded by `sync_classification_budget`; large first imports and reclassifications finish through background processing (a 100,000-entry backlog needs roughly `entries / batch size x (batch time + delay)`, dominated by Panorama latency at 5 concurrent requests).
+- Staged chunks of an open session are kept for `sync_session_ttl_minutes`; very many abandoned sessions of huge size consume database space until they expire.
+- `last_seen_at` on an ownership row is not touched by identical syncs (to keep them write-free); use the source-level last sync.
+- Verified on SQLite and on PostgreSQL 16 in development; **not verified**: a Docker image build, Docker Compose runtime, or a real Panorama.
 - Environment variables above 5 for concurrency are clamped, not rejected, on first start.
 - Rate-limit and login-failure state is per process and lost on restart.
 
 ## Tests
 
     pip install -r requirements.txt pytest && pytest
+
+**PostgreSQL 16 (repeatable, optional).** `tests/test_postgres.py` starts a real `uvicorn` process against a real
+PostgreSQL 16 database and drives the HTTP API: upgrade from a 2.2.0 database, a 64,000-entry chunked sync, an
+identical repeat, deletion and ownership reconciliation with the removal limit, duplicate handling, an interrupted
+session across `kill -9` of the server, reclassification-job persistence across `kill -9`, and concurrent syncs. It
+is skipped, with the reason, unless PostgreSQL 16 is available; the SQLite suite is unaffected and always runs.
+
+    EDL_PG_BIN=/usr/lib/postgresql/16/bin EDL_LEGACY_ARCHIVE=/path/to/edl-service-2.2.0.tar.gz \
+        pytest tests/test_postgres.py -v -s          # a throw-away cluster is created and removed
+    EDL_PG_URL=postgresql://user:pw@host/postgres pytest tests/test_postgres.py    # or an existing server (CREATEDB)
+    EDL_SERVER_DIR=/path/to/extracted/edl-service pytest tests/test_postgres.py     # test an extracted archive
+
+It is run once per release by hand or in CI (it needs about two minutes and a PostgreSQL installation); it is not part
+of the default `pytest` run in the Docker image. Not covered: more than one application process per database
+(see *Known limits*), and PostgreSQL versions other than 16.
+
+The v2.3.0 suites are `tests/test_v220_chunked.py` (sessions) and `tests/test_v230_reclassify.py` (reclassify, jobs, chunk validation, draining engine). The v2.2.0 suites are `tests/test_v220_*.py` (normalisation and upgrade, wildcard classification and
+suppression, sync, admin pages/API, integration with a mocked Panorama and a real FastAPI client asserting
+the published feed, and a 60,000-entry scale test). Existing tests were kept; where they asserted feed lines
+or stored values for domain roots, the expected value now carries the trailing slash, and three tests that
+asserted the v2.1.1 behaviour "apex policy with classification disabled publishes wildcards" now assert the
+v2.2.0 behaviour (pending).

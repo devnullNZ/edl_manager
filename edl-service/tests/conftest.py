@@ -87,6 +87,7 @@ def client(monkeypatch):
     admin._PENDING.clear()
     ratelimit.reset()
     processing_engine._reclassify_requested = False
+    processing_engine._stop.clear()
     processing_engine._last_purge = float("-inf")
     processing_engine.status.update(last_run=None, last_result=None, last_error=None)
 
@@ -161,3 +162,33 @@ def section_form(section_id, **over):
         else:
             data[f.key] = str(value)
     return data
+
+
+def sync(c, entries, list_name="default", source="yaml-import", sync_id="s-1", expect=200, token=None, **extra):
+    """POST /v1/lists/{list}/sync; returns the JSON body."""
+    body = {"source": source, "sync_id": sync_id, "entries": entries, **extra}
+    r = c.post(f"/v1/lists/{list_name}/sync", json=body, headers=bearer(token or c.token))
+    assert r.status_code == expect, r.text
+    return r.json()
+
+
+def chunked(c, entries, *, source="imp", sync_id="c1", chunk=3, delete_missing=False, confirm_empty=False,
+            dry_run=False, name="default", skip=(), commit=True, reclassify=False):
+    """Upload `entries` as a chunked sync; returns (session dict, commit response or None)."""
+    h = {"Authorization": f"Bearer {c.token}"}
+    r = c.post(f"/v1/lists/{name}/sync/sessions", headers=h,
+               json={"source": source, "sync_id": sync_id, "delete_missing": delete_missing,
+                     "confirm_empty": confirm_empty, "reclassify": reclassify})
+    assert r.status_code == 200, r.text
+    sid = r.json()["session_id"]
+    parts = [entries[i:i + chunk] for i in range(0, len(entries), chunk)]
+    for i, part in enumerate(parts):
+        if i in skip:
+            continue
+        rr = c.put(f"/v1/lists/{name}/sync/sessions/{sid}/chunks/{i}", headers=h, json={"entries": part})
+        assert rr.status_code == 200, rr.text
+    out = None
+    if commit:
+        out = c.post(f"/v1/lists/{name}/sync/sessions/{sid}/commit", headers=h,
+                     json={"total_chunks": len(parts), "total_entries": len(entries), "dry_run": dry_run})
+    return r.json(), out

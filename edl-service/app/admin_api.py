@@ -8,11 +8,13 @@ from typing import Annotated, Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import audit, runtime, service, settings_store
+from . import audit, reports, runtime, service, settings_store
 from .auth import require_api_key
-from .db import get_db
+from .db import Entry, get_db
+from .engine import processing_engine
 
 router = APIRouter(prefix="/v1/admin", tags=["admin"], dependencies=[Depends(require_api_key)])
 ACTOR = "api-key"
@@ -143,4 +145,101 @@ def get_audit(db: Annotated[Session, Depends(get_db)],
 def get_edl_status(db: Annotated[Session, Depends(get_db)]):
     """For each list: what is being published versus what is currently eligible, and whether the
     previous list is being retained (keep-previous) or the last rebuild failed."""
-    return {"lists": service.snapshot_statuses(db)}
+    return {"lists": service.snapshot_statuses(db),
+            "entries": service.entry_breakdown(db),
+            "processing": {"pending": service.pending_count(db), "reclass_remaining": service.reclass_remaining(db),
+                           "engine": processing_engine.status}}
+
+
+# --------------------------------------------------------------------------- #
+# v2.2.0: wildcards, sync history, entry details
+# --------------------------------------------------------------------------- #
+class WildcardRecheck(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    list_name: str | None = Field(None, max_length=64, alias="list", description="Only this list (default: all lists).")
+    refresh: bool = Field(True, description="Ask Panorama again instead of using cached answers.")
+
+
+@router.get("/wildcards")
+def get_wildcards(db: Annotated[Session, Depends(get_db)], list_name: Annotated[str | None, Query(alias="list", max_length=64)] = None,
+                  limit: Annotated[int, Query(ge=1, le=1000)] = 100, offset: Annotated[int, Query(ge=0)] = 0):
+    """Stored wildcard entries with their apex classification outcome and what each one suppresses."""
+    out = reports.wildcard_rows(db, list_name, limit, offset)
+    out["policy"] = service.get_settings().wildcard_classification_policy
+    return out
+
+
+@router.post("/wildcards/recheck")
+def recheck_wildcards(request: Request, db: Annotated[Session, Depends(get_db)], body: WildcardRecheck | None = None):
+    """Re-classify the wildcard entries (apex domains, de-duplicated, at most 5 requests in flight).
+    Nothing is deleted; entries already classified keep their status if Panorama is unreachable."""
+    body = body or WildcardRecheck()
+    result = service.recheck_wildcards(db, body.list_name, force=body.refresh)
+    audit.record(db, actor=ACTOR, action="wildcards.recheck", target=body.list_name or "all", ip=_ip(request),
+                 detail=str(result)[:500])
+    return result
+
+
+@router.get("/sync/sources")
+def get_sync_sources(db: Annotated[Session, Depends(get_db)], list_name: Annotated[str | None, Query(alias="list", max_length=64)] = None):
+    """Each importer (list, host, source) and the outcome of its latest sync."""
+    return {"sources": reports.sync_sources(db, list_name)}
+
+
+@router.get("/sync/runs")
+def get_sync_runs(db: Annotated[Session, Depends(get_db)], list_name: Annotated[str | None, Query(alias="list", max_length=64)] = None,
+                  source: Annotated[str | None, Query(max_length=100)] = None,
+                  limit: Annotated[int, Query(ge=1, le=200)] = 50, offset: Annotated[int, Query(ge=0)] = 0):
+    return reports.sync_runs(db, list_name, source, limit, offset)
+
+
+@router.get("/sync/runs/{run_id}")
+def get_sync_run(run_id: int, db: Annotated[Session, Depends(get_db)]):
+    """One stored sync report, including per-entry detail (capped)."""
+    run = reports.sync_run(db, run_id)
+    if run is None:
+        raise HTTPException(404, "no such sync run")
+    return run
+
+
+@router.get("/entries")
+def get_entries(db: Annotated[Session, Depends(get_db)], list_name: Annotated[str | None, Query(alias="list", max_length=64)] = None,
+                status: Annotated[Literal["active", "blocked", "pending", "unverified"] | None, Query()] = None,
+                q: Annotated[str, Query(max_length=200)] = "", suppressed: bool | None = None,
+                wildcard: bool | None = None, limit: Annotated[int, Query(ge=1, le=1000)] = 100,
+                offset: Annotated[int, Query(ge=0)] = 0):
+    """Entries with ownership, classification (method, target, categories, time), suppression and sync data."""
+    return reports.entry_rows(db, list_name, status, q, suppressed, wildcard, limit, offset)
+
+
+class EntryEnabled(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    list_name: str = Field(max_length=64, alias="list")
+    values: list[Annotated[str, Field(max_length=2048)]] = Field(min_length=1, max_length=10000)
+    enabled: bool
+
+
+@router.post("/entries/enabled")
+def set_entries_enabled(request: Request, body: EntryEnabled, db: Annotated[Session, Depends(get_db)]):
+    """Enable or disable stored entries. A disabled entry is kept (with its owners) but never published."""
+    from .normalize import normalize
+    values = set()
+    for v in body.values:
+        try:
+            values.add(normalize(v))
+        except ValueError:
+            continue
+    changed = 0
+    with service.list_lock(body.list_name):
+        for chunk in service._chunks(sorted(values), 500):
+            for e in db.scalars(select(Entry).where(Entry.list_name == body.list_name, Entry.value.in_(chunk))):
+                if (e.enabled is not False) != body.enabled:
+                    e.enabled = body.enabled
+                    changed += 1
+        db.commit()
+        service.rebuild_snapshot(db, body.list_name)
+    audit.record(db, actor=ACTOR, action="entries.enable" if body.enabled else "entries.disable",
+                 target=body.list_name, ip=_ip(request), detail=f"{changed} entr{'y' if changed == 1 else 'ies'} changed")
+    return {"changed": changed}

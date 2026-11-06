@@ -117,11 +117,15 @@ class Settings(BaseSettings):
     background_processing_enabled: bool = True
     processing_interval_seconds: int = Field(60, ge=5, le=86400)
     max_batch_size: int = Field(500, ge=1, le=10000)
+    processing_batch_delay_seconds: int = Field(1, ge=0, le=3600)
     # Palo Alto Networks recommends no more than 5 concurrent XML API requests to limit management-plane load.
     max_concurrent_requests: int = Field(
         MAX_PANORAMA_CONCURRENCY, ge=1, le=MAX_PANORAMA_CONCURRENCY,
         validation_alias=AliasChoices("max_concurrent_requests", "lookup_workers"))
     http_request_timeout: float = Field(30.0, ge=1, le=300)
+    # Most Panorama lookups ONE sync request may make. Entries beyond it are stored as pending (never
+    # published) and classified by the background engine, which keeps the request time bounded.
+    sync_classification_budget: int = Field(2000, ge=0, le=5_000_000)
     retry_attempts: int = Field(2, ge=0, le=10)
     retry_delay_seconds: int = Field(10, ge=0, le=3600)
 
@@ -130,6 +134,14 @@ class Settings(BaseSettings):
     host_ip_restrictions_enabled: bool = True
     host_token_expiry_days: int = Field(365, ge=0, le=3650)  # 0 = tokens never expire by default
     max_submission_size: int = Field(1000, ge=1, le=100000)
+    # Most entries in one POST /v1/lists/{name}/sync request (the full desired state of one source).
+    max_sync_size: int = Field(250000, ge=1, le=5_000_000)
+    # Chunked sync: the size the client is told to use, the most one chunk may hold, how long an idle
+    # session is kept, and how many commit stages (the memory-heavy step) may run at once.
+    sync_chunk_size: int = Field(10000, ge=100, le=200000)
+    sync_max_chunk_size: int = Field(25000, ge=100, le=200000)
+    sync_session_ttl_minutes: int = Field(1440, ge=1, le=43200)
+    sync_max_concurrent_commits: int = Field(2, ge=1, le=32)
     rate_limit_requests: int = Field(120, ge=0, le=1_000_000)  # 0 = unlimited
     rate_limit_interval_seconds: int = Field(60, ge=1, le=86400)
     audit_api_submissions: bool = True

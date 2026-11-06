@@ -16,9 +16,17 @@ from app.normalize import MAX_ENTRY_LENGTH, EntryTooLong, normalize
 from conftest import KEY, apex_policy, bearer, feed, login, post, put_settings, ui_post
 
 
+def canon(value):
+    """The stored (canonical) form; public-suffix wildcards (legacy data only) just gain the slash."""
+    try:
+        return normalize(value)
+    except ValueError:
+        return value if "/" in value else value + "/"
+
+
 def row(client, value):
     with client.factory() as s:
-        e = s.scalars(select(Entry).where(Entry.value == value)).one()
+        e = s.scalars(select(Entry).where(Entry.value == canon(value))).one()
         return e.status, e.detail
 
 
@@ -34,7 +42,7 @@ def no_classification(client):
 def add_raw(client, value, status="active"):
     """A stored entry as an earlier version could have left it."""
     with client.factory() as s:
-        s.add(Entry(list_name="default", value=value, status=status))
+        s.add(Entry(list_name="default", value=canon(value), status=status))
         s.commit()
         service.rebuild_snapshot(s, "default")
 
@@ -46,7 +54,7 @@ class TestWildcardExclusionIndependentOfPanorama:
         assert out["results"][0]["status"] == "blocked"
         assert row(client, "*.example.com")[0] == "blocked"
         assert "wildcard excluded by policy" in row(client, "*.example.com")[1]
-        assert feed(client).text.splitlines() == ["plain.example.com"]
+        assert feed(client).text.splitlines() == ["plain.example.com/"]
 
     def test_2_submission_classification_disabled_policy_exclude(self, client):
         no_classification(client)
@@ -63,8 +71,8 @@ class TestWildcardExclusionIndependentOfPanorama:
         no_classification(client)
         apex_policy(client)
         post(client, ["*.example.com", "ok.example.net"])
-        assert row(client, "*.example.com")[0] == "active"
-        assert feed(client).text.splitlines() == ["*.example.com", "ok.example.net"]
+        assert row(client, "*.example.com")[0] == "pending"                       # v2.2.0: not published unclassified
+        assert feed(client).text.splitlines() == ["ok.example.net/"]
 
         r = client.put("/v1/admin/settings", json={"values": {"wildcard_classification_policy": "exclude"}}, headers=KEY)
         assert r.status_code == 409                                               # still a confirmed change
@@ -72,14 +80,14 @@ class TestWildcardExclusionIndependentOfPanorama:
 
         assert row(client, "*.example.com")[0] == "blocked"                       # re-statused...
         assert count(client) == 2                                                  # ...never deleted
-        assert feed(client).text.splitlines() == ["ok.example.net"]               # immediately gone from the snapshot
+        assert feed(client).text.splitlines() == ["ok.example.net/"]               # immediately gone from the snapshot
 
     def test_3b_same_with_classification_enabled(self, client):
         apex_policy(client)
         post(client, ["*.example.com"])
-        assert feed(client).text.splitlines() == ["*.example.com"]
+        assert feed(client).text.splitlines() == ["*.example.com/"]
         put_settings(client, {"wildcard_classification_policy": "exclude"}, confirm=True)
-        assert feed(client).text == "" and row(client, "*.example.com")[0] == "blocked"
+        assert feed(client).text == "" and row(client, "*.example.com/")[0] == "blocked"
 
     @pytest.mark.parametrize("enabled", [True, False])
     def test_4_existing_wildcard_during_reclassification_is_not_revived(self, client, enabled):
@@ -92,14 +100,14 @@ class TestWildcardExclusionIndependentOfPanorama:
                     lambda: eng.tick(force=True, reclassify=True)):
             run()
             assert row(client, "*.example.com")[0] == "blocked", run
-            assert feed(client).text.splitlines() == ["ok.example.com"], run
+            assert feed(client).text.splitlines() == ["ok.example.com/"], run
 
     def test_4b_blocked_wildcard_stays_blocked_after_classification_is_switched_off_and_rechecked(self, client):
         post(client, ["*.example.com"])
         assert row(client, "*.example.com")[0] == "blocked"
         no_classification(client)
         client.post("/v1/lists/default/recheck", headers=KEY)
-        assert row(client, "*.example.com")[0] == "blocked" and feed(client).text == ""
+        assert row(client, "*.example.com/")[0] == "blocked" and feed(client).text == ""
 
     def test_5_ordinary_domains_when_classification_disabled(self, client):
         no_classification(client)
@@ -107,13 +115,13 @@ class TestWildcardExclusionIndependentOfPanorama:
         out = post(client, ["bad.evil.net", "x.example.com", "example.com", "y.example.org/path"])
         assert {r["status"] for r in out["results"]} == {"added"}
         assert len(client.fake.calls) == n                                         # Panorama never consulted
-        assert feed(client).text.splitlines() == ["bad.evil.net", "example.com", "x.example.com", "y.example.org/path"]
+        assert feed(client).text.splitlines() == ["bad.evil.net/", "example.com/", "x.example.com/", "y.example.org/path"]
         assert {row(client, v)[0] for v in ("bad.evil.net", "x.example.com", "example.com")} == {"active"}
 
     def test_5b_apex_and_wildcard_listed_together_only_apex_published(self, client):
         no_classification(client)
         post(client, ["example.com", "*.example.com"])
-        assert feed(client).text.splitlines() == ["example.com"]
+        assert feed(client).text.splitlines() == ["example.com/"]
 
     def test_6_submission_policy_apex_classification(self, client):
         apex_policy(client)
@@ -122,22 +130,27 @@ class TestWildcardExclusionIndependentOfPanorama:
         status, detail = row(client, "*.example.com")
         assert status == "active" and "NOT verified" in detail
         assert row(client, "*.bad.example.net")[0] == "blocked"
-        assert feed(client).text.splitlines() == ["*.example.com"]
+        assert feed(client).text.splitlines() == ["*.example.com/"]
 
-    def test_6b_apex_policy_with_classification_disabled_publishes(self, client):
+    def test_6b_apex_policy_with_classification_disabled_stays_pending(self, client):
+        # v2.2.0 (changed from v2.1.1, which published here): apex classification is required by this
+        # policy, so a wildcard is never published while classification is switched off.
         no_classification(client)
         apex_policy(client)
         n = len(client.fake.calls)
-        post(client, ["*.example.com"])
+        out = post(client, ["*.example.com"])
         assert len(client.fake.calls) == n
-        assert row(client, "*.example.com")[0] == "active" and feed(client).text.splitlines() == ["*.example.com"]
+        assert out["results"][0]["status"] == "pending"
+        assert row(client, "*.example.com/")[0] == "pending" and feed(client).text == ""
 
-    def test_switching_back_to_apex_with_classification_disabled_republishes(self, client):
+    def test_switching_back_to_apex_with_classification_disabled_stays_pending(self, client):
+        # v2.2.0: this policy requires the base domain to be classified, so with classification off the
+        # wildcard is released from the exclusion but is NOT published (it was published in v2.1.1).
         no_classification(client)
         post(client, ["*.example.com"])
         apex_policy(client)
         eng.tick(force=True)
-        assert row(client, "*.example.com")[0] == "active" and feed(client).text.splitlines() == ["*.example.com"]
+        assert row(client, "*.example.com/")[0] == "pending" and feed(client).text == ""
 
     def test_pending_and_unverified_wildcards_are_excluded_too(self, client):
         no_classification(client)
@@ -154,10 +167,10 @@ class TestWildcardExclusionIndependentOfPanorama:
         no_classification(client)
         add_raw(client, "*.example.com", "active")
         add_raw(client, "keep.example.com", "active")
-        assert "*.example.com" in feed(client).text
+        assert "*.example.com/" in feed(client).text
         client.main.init_app(client.engine, client.factory)                       # start the new version
         assert row(client, "*.example.com")[0] == "blocked" and count(client) == 2
-        assert feed(client).text.splitlines() == ["keep.example.com"]
+        assert feed(client).text.splitlines() == ["keep.example.com/"]
 
     def test_public_suffix_wildcard_still_blocked_when_classification_disabled(self, client):
         no_classification(client)
@@ -224,7 +237,7 @@ class TestUrlLength:
         r = client.request("DELETE", "/v1/lists/default/entries",
                            json={"urls": ["keep.example.com", url_of_length(2049)]}, headers=KEY)
         assert r.status_code == 422 and "urls[1]" in r.json()["detail"]["errors"][0]
-        assert feed(client).text.splitlines() == ["keep.example.com"]            # nothing was deleted
+        assert feed(client).text.splitlines() == ["keep.example.com/"]            # nothing was deleted
         ok = client.request("DELETE", "/v1/lists/default/entries", json={"urls": ["keep.example.com"]}, headers=KEY)
         assert ok.json() == {"deleted": 1}
 
@@ -548,19 +561,19 @@ class TestTrackersUseCleanup:
 # =========================================================================== 5. version
 class TestVersion:
     def test_version_constant(self):
-        assert __version__ == "2.1.1"
+        assert __version__ == "2.3.1"
 
-    def test_openapi_reports_2_1_1(self, client):
-        assert client.main.app.version == "2.1.1"
-        assert client.main.app.openapi()["info"]["version"] == "2.1.1"
-        assert client.get("/openapi.json").json()["info"]["version"] == "2.1.1"
+    def test_openapi_reports_current_version(self, client):
+        assert client.main.app.version == "2.3.1"
+        assert client.main.app.openapi()["info"]["version"] == "2.3.1"
+        assert client.get("/openapi.json").json()["info"]["version"] == "2.3.1"
 
     def test_healthz_reports_version(self, client):
-        assert client.get("/healthz").json()["version"] == "2.1.1"
+        assert client.get("/healthz").json()["version"] == "2.3.1"
 
     def test_documentation_identifies_the_release(self):
         readme = Path(__file__).resolve().parent.parent.joinpath("README.md").read_text()
-        assert "2.1.1" in readme.split("\n## ", 1)[0] and "Upgrading from v2.1.0" in readme
+        assert "2.3.1" in readme.split("\n## ", 1)[0] and "Upgrading from v2.1.0" in readme and "Upgrading from v2.1.1" in readme
 
     def test_no_stale_version_strings(self):
         for p in Path(__file__).resolve().parent.parent.joinpath("app").glob("*.py"):

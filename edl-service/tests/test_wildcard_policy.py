@@ -2,6 +2,7 @@
 from sqlalchemy import select
 
 from app import service
+from app.normalize import normalize
 from app.db import Entry
 from app.panorama import lookup_target
 from conftest import KEY, apex_policy, feed, post, put_settings
@@ -9,7 +10,7 @@ from conftest import KEY, apex_policy, feed, post, put_settings
 
 def entry(client, value):
     with client.factory() as s:
-        e = s.scalars(select(Entry).where(Entry.value == value)).one()
+        e = s.scalars(select(Entry).where(Entry.value == normalize(value))).one()
         return e.status, e.detail
 
 
@@ -25,7 +26,7 @@ def test_exclude_policy_never_publishes_wildcards_and_makes_no_lookup(client):
     assert by["*.example.com"]["status"] == "blocked"
     assert "cannot vouch for every subdomain" in by["*.example.com"]["detail"]
     assert by["example.com"]["status"] == "added"
-    assert feed(client).text.splitlines() == ["example.com"]
+    assert feed(client).text.splitlines() == ["example.com/"]
     assert client.fake.calls[n:] == ["example.com"]           # no query for the wildcard
 
 
@@ -43,7 +44,7 @@ def test_apex_policy_classifies_base_domain_only_and_says_so(client):
     assert out["results"][0]["status"] == "added"
     status, detail = entry(client, "*.example.com")
     assert status == "active" and "NOT verified" in detail
-    assert feed(client).text.splitlines() == ["*.example.com"]
+    assert feed(client).text.splitlines() == ["*.example.com/"]
 
 
 def test_apex_policy_blocks_wildcard_when_base_domain_is_high_risk(client):
@@ -63,11 +64,11 @@ def test_ordinary_urls_unchanged_by_policy(client):
 def test_switching_to_exclude_removes_published_wildcards_immediately(client):
     apex_policy(client)
     post(client, ["*.example.com", "plain.example.org"])
-    assert "*.example.com" in feed(client).text
+    assert "*.example.com/" in feed(client).text
     r = client.put("/v1/admin/settings", json={"values": {"wildcard_classification_policy": "exclude"}}, headers=KEY)
     assert r.status_code == 409 and "Wildcard" in r.json()["detail"]["requires_confirmation"][0]
     put_settings(client, {"wildcard_classification_policy": "exclude"}, confirm=True)
-    assert feed(client).text.splitlines() == ["plain.example.org"]
+    assert feed(client).text.splitlines() == ["plain.example.org/"]
     status, detail = entry(client, "*.example.com")                  # row kept, reason recorded
     assert status == "blocked" and "wildcard excluded by policy" in detail
 
@@ -79,7 +80,7 @@ def test_switching_back_to_apex_requeues_wildcards_for_classification(client):
     from app.engine import processing_engine as eng
     eng.tick(force=True)
     assert entry(client, "*.example.com")[0] == "active"
-    assert feed(client).text.splitlines() == ["*.example.com"]
+    assert feed(client).text.splitlines() == ["*.example.com/"]
 
 
 def test_lookup_target_documents_apex_proxy():
@@ -95,13 +96,13 @@ def test_ui_and_api_explain_the_limitation(client):
     assert "does NOT prove" in item["description"] and "subdomain" in item["description"]
 
 
-def test_classification_disabled_publishes_wildcards_only_when_apex_policy_is_explicit(client):
-    # v2.1.1: with the default 'exclude' policy a wildcard is never published, even with classification
-    # off (see test_v211.py). Publishing it requires explicitly choosing apex-classification.
+def test_classification_disabled_never_publishes_wildcards_under_apex_policy(client):
+    # v2.1.1 published here. v2.2.0: the apex policy REQUIRES the base domain to be classified, and with
+    # classification off that cannot happen, so the wildcard stays pending (and unpublished).
     put_settings(client, {"classification_enabled": False}, confirm=True)
     apex_policy(client)
     post(client, ["*.example.com"])
-    assert feed(client).text.splitlines() == ["*.example.com"]
+    assert feed(client).text == ""
 
 
 def test_recheck_keeps_policy(client):

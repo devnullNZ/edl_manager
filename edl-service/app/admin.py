@@ -15,17 +15,17 @@ from pathlib import Path
 from typing import Annotated, Literal
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Request
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import audit, ratelimit, runtime, security_checks, service, settings_store
+from . import audit, ratelimit, reports, runtime, security_checks, service, settings_store
 from . import hosts as hosts_mod
 from .config import get_bootstrap, get_settings
-from .db import AllowedHost, EdlSnapshot, get_db
+from .db import AllowedHost, get_db
 from .engine import processing_engine
 
 router = APIRouter(prefix="/admin", include_in_schema=False)
@@ -194,7 +194,14 @@ def _extras(section_id: str, db: Session, s) -> dict:
     if section_id == "edl":
         return {"snapshots": _snapshots(db)}
     if section_id == "processing":
+        from .db import ReclassJob
+        jobs = list(db.scalars(select(ReclassJob).order_by(ReclassJob.id.desc()).limit(10)))
         return {"engine": processing_engine.status, "pending": service.pending_count(db),
+                "breakdown": service.entry_breakdown(db),
+                "reclass_remaining": service.reclass_remaining(db),
+                "jobs": [{"id": j.id, "list": j.list_name, "source": f"{j.host}:{j.source_id}", "status": j.status,
+                          "total": j.total, "remaining": service.reclass_remaining(db, j.id),
+                          "created": j.created_at} for j in jobs],
                 "last_reclass": settings_store.get_state(db, "last_reclassification")}
     return {}
 
@@ -241,7 +248,9 @@ def overview(request: Request, db: Annotated[Session, Depends(get_db)]):
                             "still being served. See the application log.")
     rows = [(sec, [(f, settings_store.display_value(f, s)) for f in sec.fields]) for sec in settings_store.SECTIONS]
     return render(request, "overview.html", active="overview", rows=rows, status=status, warnings=warnings,
-                  pending=pending, snapshots=snaps, engine=processing_engine.status)
+                  pending=pending, reclass_remaining=service.reclass_remaining(db), snapshots=snaps,
+                  breakdown=service.entry_breakdown(db),
+                  engine=processing_engine.status)
 
 
 @router.get("/settings/{section_id}", dependencies=[Depends(require_admin)])
@@ -438,3 +447,57 @@ def audit_page(request: Request, db: Annotated[Session, Depends(get_db)],
     total, rows = audit.recent(db, kind=kind or None, limit=size, offset=(page - 1) * size)
     return render(request, "audit.html", active="audit", rows=rows, total=total, kind=kind, page=page,
                   pages=max(1, -(-total // size)))
+
+
+# --------------------------------------------------------------------------- #
+# wildcards, sync history, entries (v2.2.0)
+# --------------------------------------------------------------------------- #
+@router.get("/wildcards", dependencies=[Depends(require_admin)])
+def wildcards_page(request: Request, db: Annotated[Session, Depends(get_db)], page: int = 1):
+    page = max(page, 1)
+    size = 100
+    data = reports.wildcard_rows(db, None, size, (page - 1) * size)
+    s = get_settings()
+    return render(request, "wildcards.html", active="wildcards", data=data, page=page,
+                  pages=max(1, -(-data["total"] // size)), policy=s.wildcard_classification_policy,
+                  policy_label=dict(settings_store.FIELD_BY_KEY["wildcard_classification_policy"].labels)
+                  .get(s.wildcard_classification_policy), classification_on=s.classification_enabled)
+
+
+@router.post("/wildcards/recheck", dependencies=Authed)
+def wildcards_recheck(request: Request, db: Annotated[Session, Depends(get_db)]):
+    result = service.recheck_wildcards(db, None, force=True)
+    audit.record(db, actor=_actor(), action="wildcards.recheck", target="all", ip=_ip(request), detail=str(result)[:500])
+    _flash(request, "ok", f"Wildcard recheck finished: {result['checked']} checked, {result['changed']} changed status.")
+    return redirect("/wildcards")
+
+
+@router.get("/sync", dependencies=[Depends(require_admin)])
+def sync_page(request: Request, db: Annotated[Session, Depends(get_db)], page: int = 1):
+    page = max(page, 1)
+    size = 25
+    runs = reports.sync_runs(db, None, None, size, (page - 1) * size)
+    return render(request, "sync.html", active="sync", sources=reports.sync_sources(db), runs=runs, page=page,
+                  pages=max(1, -(-runs["total"] // size)))
+
+
+@router.get("/sync/runs/{run_id}", dependencies=[Depends(require_admin)])
+def sync_run_page(run_id: int, request: Request, db: Annotated[Session, Depends(get_db)]):
+    run = reports.sync_run(db, run_id)
+    if run is None:
+        raise HTTPException(404, "no such sync run")
+    return render(request, "sync_run.html", active="sync", run=run)
+
+
+@router.get("/entries", dependencies=[Depends(require_admin)])
+def entries_page(request: Request, db: Annotated[Session, Depends(get_db)], q: str = "", status: str = "",
+                 list_name: Annotated[str, Query(alias="list")] = "", show: Literal["", "wildcards", "suppressed"] = "",
+                 page: int = 1):
+    page = max(page, 1)
+    size = 50
+    status = status if status in ("active", "blocked", "pending", "unverified") else ""
+    data = reports.entry_rows(db, list_name[:64] or None, status or None, q[:200],
+                              suppressed=True if show == "suppressed" else None,
+                              wildcard=True if show == "wildcards" else None, limit=size, offset=(page - 1) * size)
+    return render(request, "entries.html", active="entries", data=data, q=q, status=status, list_name=list_name,
+                  show=show, page=page, pages=max(1, -(-data["total"] // size)))

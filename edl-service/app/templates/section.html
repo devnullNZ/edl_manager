@@ -49,7 +49,7 @@
           <input type="checkbox" id="{{ f.key }}" name="{{ f.key }}" {% if values[f.key] %}checked{% endif %}>
         {% elif f.kind == 'choice' %}
           <select id="{{ f.key }}" name="{{ f.key }}">
-            {% for c in choices[f.key] %}<option value="{{ c }}" {% if values[f.key] == c %}selected{% endif %}>{{ c }}</option>{% endfor %}
+            {% for c in choices[f.key] %}<option value="{{ c }}" {% if values[f.key] == c %}selected{% endif %}>{{ f.label_for(c) }}</option>{% endfor %}
           </select>
         {% elif f.kind == 'multiselect' %}
           <div class="checks" role="group" aria-label="{{ f.label }}">
@@ -81,8 +81,14 @@
 {% if section.id == 'processing' %}
   <div class="card" style="margin-top:22px">
     <h2>Engine status</h2>
+    <table><thead><tr><th>List</th><th>Uploaded</th><th>Approved</th><th>Blocked</th><th>Pending</th><th>Unverified</th><th>Suppressed</th><th>Disabled</th><th>Published</th></tr></thead><tbody>
+    {% for r in extra.breakdown %}<tr><td><code>{{ r.list_name }}</code></td><td>{{ r.uploaded }}</td><td>{{ r.approved }}</td><td>{{ r.blocked }}</td><td>{{ r.pending }}</td><td>{{ r.unverified }}</td><td>{{ r.suppressed }}</td><td>{{ r.disabled }}</td><td>{{ r.published }}</td></tr>{% else %}<tr><td colspan="9" class="muted">No entries yet.</td></tr>{% endfor %}
+    </tbody></table>
     <dl class="kv">
       <dt>Pending / unverified entries</dt><dd>{{ extra.pending }}</dd>
+      <dt>Entries awaiting reclassification</dt><dd>{{ extra.reclass_remaining }}</dd>
+      <dt>Engine</dt><dd>{% set pg = extra.engine.progress %}{% if pg %}<span class="tag {{ '' if pg.state == 'idle' else 'warn' }}">{{ pg.state }}</span>{% if pg.state == 'draining' %} batch {{ pg.batches }}, {{ pg.processed }} entries handled; {{ pg.get('not_yet_attempted_this_cycle', 0) }} still to try this cycle{% endif %}{% else %}not yet run{% endif %}</dd>
+      {% if extra.engine.last_result and extra.engine.last_result.drain %}<dt>Last cycle</dt><dd>{{ extra.engine.last_result.drain.batches }} batch(es), {{ extra.engine.last_result.drain.processed }} entries, {{ extra.engine.last_result.drain.changed }} changed; ended: {{ extra.engine.last_result.drain.ended }}</dd>{% endif %}
       <dt>Last run</dt><dd>{% if extra.engine.last_run %}{{ extra.engine.last_run | localtime('%Y-%m-%d %H:%M:%S') }}{% if extra.engine.last_error %} <span class="tag err">error: {{ extra.engine.last_error }}</span>{% endif %}{% else %}not yet{% endif %}</dd>
       <dt>Last reclassification</dt><dd>{% if extra.last_reclass %}{{ extra.last_reclass.at[:16] | replace('T', ' ') }} UTC{% else %}not yet{% endif %}</dd>
     </dl>
@@ -90,7 +96,13 @@
       <form method="post" action="/admin/processing/run"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Run processing now</button></form>
       <form method="post" action="/admin/processing/reclassify"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Reclassify all entries now</button></form>
     </div>
-    <p class="muted">Both run even when background processing is disabled. Reclassification asks Panorama again for every entry.</p>
+    <p class="muted">Both run even when background processing is disabled. Reclassification asks Panorama again for every entry. While work remains, background processing keeps taking batches (see Delay between batches) instead of waiting for the next interval.</p>
+    {% if extra.jobs %}
+    <h3 style="margin-top:16px">Reclassification jobs (from sync requests)</h3>
+    <table><thead><tr><th>Job</th><th>List</th><th>Source</th><th>Status</th><th>Entries</th><th>Remaining</th><th>Started</th></tr></thead><tbody>
+    {% for j in extra.jobs %}<tr><td>{{ j.id }}</td><td>{{ j.list }}</td><td>{{ j.source }}</td><td>{{ j.status }}</td><td>{{ j.total }}</td><td>{{ j.remaining }}</td><td>{{ j.created | localtime('%Y-%m-%d %H:%M') }}</td></tr>{% endfor %}
+    </tbody></table>
+    {% endif %}
   </div>
 {% endif %}
 {% endblock %}

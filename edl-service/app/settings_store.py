@@ -37,6 +37,10 @@ class Field:
     help: str = ""
     choices: tuple[str, ...] = ()
     unit: str = ""
+    labels: tuple[tuple[str, str], ...] = ()  # (stored value, display text) for choices shown differently
+
+    def label_for(self, choice: str) -> str:
+        return dict(self.labels).get(choice, choice)
 
 
 @dataclass(frozen=True)
@@ -107,7 +111,8 @@ SECTIONS: tuple[Section, ...] = (
               "nothing reliable about a.example.com or any other subdomain. exclude (recommended) never "
               "publishes wildcard entries. apex-classification checks only the base domain and publishes the "
               "wildcard if that is clean, which does NOT prove the subdomains are safe.",
-              choices=("exclude", "apex-classification")),
+              choices=("exclude", "apex-classification"),
+              labels=(("exclude", "Exclude"), ("apex-classification", "Classify Apex Domain"))),
     )),
     Section("edl", "EDL Configuration", "What is published to the firewalls.", (
         Field("edl_publishing_enabled", "Enable EDL publishing", "bool",
@@ -137,10 +142,18 @@ SECTIONS: tuple[Section, ...] = (
               "How often the engine looks for pending entries.", unit="seconds"),
         Field("max_batch_size", "Maximum batch size", "int",
               "Most URLs handled in one processing batch.", unit="URLs"),
+        Field("processing_batch_delay_seconds", "Delay between batches", "int",
+              "While classification work remains (pending entries, reclassification jobs) the engine keeps "
+              "going batch after batch, pausing this long between batches. When no work is left it waits for "
+              "the processing interval.", unit="seconds"),
         Field("max_concurrent_requests", "Maximum concurrent requests", "int",
               "Parallel Panorama XML API requests, process-wide (API submissions, background processing and rechecks share this limit). Palo Alto Networks recommends at most 5, which is the enforced maximum.", unit="requests"),
         Field("http_request_timeout", "HTTP request timeout", "float",
               "Seconds to wait for a response from Panorama.", unit="seconds"),
+        Field("sync_classification_budget", "Sync classification budget", "int",
+              "Most Panorama lookups one sync request makes. New entries beyond it are stored as pending "
+              "(not published) and classified by background processing, so a large first import cannot "
+              "hold a request open for hours. 0 means a sync never queries Panorama itself.", unit="lookups"),
         Field("retry_attempts", "Retry attempts", "int",
               "Extra rounds the engine makes for entries whose classification failed, within one run.",
               unit="retries"),
@@ -155,6 +168,18 @@ SECTIONS: tuple[Section, ...] = (
               "Validity of newly issued host tokens. 0 means they never expire.", unit="days"),
         Field("max_submission_size", "Maximum submission size", "int",
               "Most URLs accepted in one POST request.", unit="URLs"),
+        Field("max_sync_size", "Maximum sync size", "int",
+              "Most entries in ONE logical sync, whether sent in a single request or in chunks.", unit="entries"),
+        Field("sync_chunk_size", "Sync chunk size", "int",
+              "Entries per chunk that importers are told to use for chunked syncs.", unit="entries"),
+        Field("sync_max_chunk_size", "Largest accepted chunk", "int",
+              "Most entries one chunk request may contain (HTTP 413 above it).", unit="entries"),
+        Field("sync_session_ttl_minutes", "Chunked sync idle timeout", "int",
+              "An unfinished chunked sync with no activity for this long is expired and its staged data "
+              "discarded. The list is never changed by an expired sync.", unit="minutes"),
+        Field("sync_max_concurrent_commits", "Concurrent sync commits", "int",
+              "Most sync commit stages (across all lists) running at once. Each holds the desired state in "
+              "memory, so this bounds memory use.", unit="syncs"),
         Field("rate_limit_requests", "Rate limit", "int",
               "Most requests per host within the interval below. 0 disables the limit.", unit="requests"),
         Field("rate_limit_interval_seconds", "Rate limit interval", "int",
@@ -164,6 +189,7 @@ SECTIONS: tuple[Section, ...] = (
     )),
 )
 SECTION_BY_ID = {s.id: s for s in SECTIONS}
+FIELD_BY_KEY = {f.key: f for sec in SECTIONS for f in sec.fields}
 EDITABLE: dict[str, Field] = {f.key: f for s in SECTIONS for f in s.fields}
 SECTION_OF: dict[str, str] = {f.key: s.id for s in SECTIONS for f in s.fields}
 SECRET_KEYS = {k for k, f in EDITABLE.items() if f.kind == "secret"}

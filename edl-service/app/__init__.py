@@ -1,2 +1,2 @@
 """EDL Publisher."""
-__version__ = "2.1.1"
+__version__ = "2.3.1"

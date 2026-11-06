@@ -39,7 +39,7 @@ def test_snapshot_recovers_after_failure(client, monkeypatch):
     real = service.build_body
     monkeypatch.setattr(service, "build_body", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
     client.request("DELETE", "/v1/lists/default/entries", json={"urls": ["a.example.com"]}, headers=KEY)
-    assert feed(client).text.splitlines() == ["a.example.com"]       # stale but valid; DB already changed
+    assert feed(client).text.splitlines() == ["a.example.com/"]       # stale but valid; DB already changed
     assert status(client)["last_error"]                              # the failure is visible to administrators
     monkeypatch.setattr(service, "build_body", real)
     with client.factory() as s:
@@ -61,7 +61,7 @@ def test_snapshot_update_is_one_transaction(client, monkeypatch):
 
     # make the DB change committed, then fail the snapshot's commit
     with client.factory() as s:
-        s.add(Entry(list_name="default", value="new.example.com", status="active"))
+        s.add(Entry(list_name="default", value="new.example.com/", status="active"))
         real_commit(s)
         monkeypatch.setattr(Session, "commit", failing_commit)
         service.rebuild_snapshot(s, "default")
@@ -69,7 +69,7 @@ def test_snapshot_update_is_one_transaction(client, monkeypatch):
     assert snap_row(client) == before                                  # body, etag, count all unchanged together
     with client.factory() as s:
         service.rebuild_snapshot(s, "default")
-    assert "new.example.com" in feed(client).text
+    assert "new.example.com/" in feed(client).text
 
 
 def test_processing_exception_does_not_touch_the_feed(client, monkeypatch):
@@ -87,10 +87,10 @@ def test_panorama_outage_during_reclassification_does_not_empty_the_feed(client)
     put_settings(client, {"retry_delay_seconds": 0})
     client.fake.fail_next = 10_000                                    # Panorama down for the whole run
     res = eng.tick(force=True, reclassify=True, refresh=True)
-    assert feed(client).text == before and before.splitlines() == ["a.example.com", "b.example.com"]
+    assert feed(client).text == before and before.splitlines() == ["a.example.com/", "b.example.com/"]
     with client.factory() as s:
         statuses = {e.value: e.status for e in s.scalars(select(Entry))}
-    assert statuses == {"a.example.com": "active", "b.example.com": "active", "bad.example.net": "blocked"}
+    assert statuses == {"a.example.com/": "active", "b.example.com/": "active", "bad.example.net/": "blocked"}
     assert res["reclassification"]["checked"] == 3
 
 
@@ -104,7 +104,7 @@ def test_recheck_endpoint_survives_outage_too(client):
     post(client, ["a.example.com"])
     client.fake.fail_next = 10_000
     client.post("/v1/lists/default/recheck", headers=KEY)
-    assert feed(client).text.splitlines() == ["a.example.com"]
+    assert feed(client).text.splitlines() == ["a.example.com/"]
 
 
 # ------------------------------------------------------------------ empty behaviour is explicit
@@ -127,12 +127,12 @@ def test_keep_previous_is_flagged_not_silent(client, caplog):
     put_settings(client, {"edl_empty_behaviour": "keep-previous"}, confirm=True)
     post(client, ["a.example.com"])
     client.request("DELETE", "/v1/lists/default/entries", json={"urls": ["a.example.com"]}, headers=KEY)
-    assert feed(client).text.splitlines() == ["a.example.com"]       # old entries still served...
+    assert feed(client).text.splitlines() == ["a.example.com/"]       # old entries still served...
     st = status(client)                                              # ...but administrators are told
     assert st["retained"] is True and st["differs"] is True and st["only_published"] == 1
     assert "keep-previous" in st["note"] and "still being served" in st["note"]
     assert st["serving"] == "previous list retained (keep-previous)"
-    assert st["sample_only_published"] == ["a.example.com"] and st["eligible_count"] == 0
+    assert st["sample_only_published"] == ["a.example.com/"] and st["eligible_count"] == 0
 
     login(client)
     assert "still being served" in client.get("/admin/settings").text            # overview warning
@@ -145,7 +145,7 @@ def test_keep_previous_clears_when_valid_entries_return(client):
     post(client, ["a.example.com"])
     client.request("DELETE", "/v1/lists/default/entries", json={"urls": ["a.example.com"]}, headers=KEY)
     post(client, ["b.example.com"])
-    assert feed(client).text.splitlines() == ["b.example.com"]
+    assert feed(client).text.splitlines() == ["b.example.com/"]
     st = status(client)
     assert not st["retained"] and not st["differs"] and st["note"] is None
 
@@ -168,7 +168,7 @@ def test_retained_state_survives_restart(client):
     post(client, ["a.example.com"])
     client.request("DELETE", "/v1/lists/default/entries", json={"urls": ["a.example.com"]}, headers=KEY)
     client.main.init_app(client.engine, client.factory)
-    assert feed(client).text.splitlines() == ["a.example.com"] and status(client)["retained"]
+    assert feed(client).text.splitlines() == ["a.example.com/"] and status(client)["retained"]
 
 
 # ------------------------------------------------------------------ visibility of drift

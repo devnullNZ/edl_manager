@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text, UniqueConstraint, create_engine
+from sqlalchemy import (Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint,
+                        create_engine, false, true)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from .config import get_bootstrap
@@ -9,6 +10,19 @@ _settings = get_bootstrap()
 _connect_args = {"check_same_thread": False} if _settings.database_url.startswith("sqlite") else {}
 engine = create_engine(_settings.database_url, pool_pre_ping=True, connect_args=_connect_args)
 SessionLocal = sessionmaker(engine, expire_on_commit=False)
+
+if _settings.database_url.startswith("sqlite") and ":memory:" not in _settings.database_url \
+        and _settings.database_url not in ("sqlite://", "sqlite:///"):
+    from sqlalchemy import event as _event
+
+    @_event.listens_for(engine, "connect")
+    def _sqlite_pragmas(dbapi_conn, _record):
+        """WAL lets feed downloads keep reading while a sync writes; busy_timeout waits instead of failing."""
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA synchronous=NORMAL")
+        cur.execute("PRAGMA busy_timeout=30000")
+        cur.close()
 
 
 def utcnow() -> datetime:
@@ -39,6 +53,167 @@ class Entry(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     # time of the last classification attempt (successful or not)
     checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # --- v2.2.0 -----------------------------------------------------------------------------
+    # Administrative switch: a disabled entry is stored but never published.
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
+    # The APPROVED wildcard entry that currently suppresses this one (None = not suppressed). The row is
+    # never deleted for this reason; it becomes eligible again when the wildcard is removed or blocked.
+    suppressed_by: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    # How this entry was last classified. `value` is the original entry (the wildcard, for wildcards).
+    #   method : url | wildcard_apex          target : what was actually submitted to Panorama
+    #   result : clean | blocked | unknown | error | excluded | disabled
+    #   categories : comma separated Panorama categories    status : approved | blocked | pending | excluded
+    class_method: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    class_target: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    class_result: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    class_categories: Mapped[str | None] = mapped_column(Text, nullable=True)
+    class_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Set while a sync asked for this entry to be reclassified and the answer has not been obtained yet
+    # (ReclassJob.id). The background engine clears it once Panorama gave a conclusive answer.
+    reclass_job_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+
+
+class EntrySource(Base):
+    """Who is responsible for an entry. An entry can have several owners (different hosts or sync
+    sources, or the legacy submission endpoint); it exists as long as at least one remains."""
+
+    __tablename__ = "entry_sources"
+    __table_args__ = (
+        UniqueConstraint("entry_id", "kind", "host", "source_id", name="uq_entry_owner"),
+        Index("ix_entry_sources_owner", "list_name", "host", "source_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    entry_id: Mapped[int] = mapped_column(Integer, ForeignKey("entries.id", ondelete="CASCADE"), index=True)
+    list_name: Mapped[str] = mapped_column(String(64))
+    kind: Mapped[str] = mapped_column(String(8))            # sync | api
+    host: Mapped[str] = mapped_column(String(64))            # submitting host name
+    source_id: Mapped[str] = mapped_column(String(100), default="")   # sync "source" / API "source" note
+    yaml_list: Mapped[str | None] = mapped_column(String(256), nullable=True)  # original list name in the importer's YAML
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_sync_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+
+class SyncSource(Base):
+    """One importer (host + source id) for one list, and the outcome of its latest sync."""
+
+    __tablename__ = "sync_sources"
+    __table_args__ = (UniqueConstraint("list_name", "host", "source_id", name="uq_sync_source"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    list_name: Mapped[str] = mapped_column(String(64), index=True)
+    host: Mapped[str] = mapped_column(String(64))
+    source_id: Mapped[str] = mapped_column(String(100))
+    last_sync_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_status: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    last_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_summary: Mapped[str | None] = mapped_column(Text, nullable=True)   # JSON counts
+
+
+class SyncRun(Base):
+    """History of sync requests that changed (or tried to change) the database. Dry runs are not
+    recorded: they write nothing."""
+
+    __tablename__ = "sync_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    list_name: Mapped[str] = mapped_column(String(64), index=True)
+    host: Mapped[str] = mapped_column(String(64))
+    source_id: Mapped[str] = mapped_column(String(100))
+    sync_id: Mapped[str] = mapped_column(String(128))
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(24))       # applied | no_change | failed
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)   # JSON counts
+    report: Mapped[str | None] = mapped_column(Text, nullable=True)    # JSON, per-entry detail (capped)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Set only for successful runs. UNIQUE, so one sync_id can be applied once per list and source.
+    dedup_key: Mapped[str | None] = mapped_column(String(400), unique=True, nullable=True)
+
+
+class SyncSession(Base):
+    """A chunked (resumable) sync. Chunks are STAGED in sync_staged; nothing in `entries` changes until
+    the commit stage has verified that every chunk arrived. The row survives restarts, so an interrupted
+    upload resumes where it stopped, and an abandoned one expires without ever touching the list."""
+
+    __tablename__ = "sync_sessions"
+    __table_args__ = (UniqueConstraint("list_name", "host", "source_id", "sync_id", name="uq_sync_session"),
+                      Index("ix_sync_sessions_owner", "list_name", "host", "source_id", "status"))
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    list_name: Mapped[str] = mapped_column(String(64))
+    host: Mapped[str] = mapped_column(String(64))
+    source_id: Mapped[str] = mapped_column(String(100))
+    sync_id: Mapped[str] = mapped_column(String(128))
+    delete_missing: Mapped[bool] = mapped_column(Boolean, default=False)
+    confirm_empty: Mapped[bool] = mapped_column(Boolean, default=False)
+    reclassify: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    received_invalid: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    chunk_size: Mapped[int] = mapped_column(Integer, default=0)       # advertised to the client
+    # receiving -> committed (applied / no_change, run_id set) | aborted | expired
+    status: Mapped[str] = mapped_column(String(16), default="receiving")
+    received_chunks: Mapped[int] = mapped_column(Integer, default=0)
+    received_entries: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class SyncChunk(Base):
+    """One received chunk of a session. (session, index) is unique, so re-sending a chunk after a
+    timeout is harmless: an identical chunk is acknowledged again, a different one is refused."""
+
+    __tablename__ = "sync_chunks"
+
+    session_id: Mapped[int] = mapped_column(Integer, ForeignKey("sync_sessions.id", ondelete="CASCADE"),
+                                            primary_key=True)
+    idx: Mapped[int] = mapped_column(Integer, primary_key=True)
+    entries: Mapped[int] = mapped_column(Integer)
+    invalid: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    digest: Mapped[str] = mapped_column(String(64))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class SyncStaged(Base):
+    """Staged, not-yet-applied entries of a session (canonical value, or the rejected raw text with a
+    reason). Deleted when the session ends."""
+
+    __tablename__ = "sync_staged"
+    __table_args__ = (Index("ix_sync_staged_session", "session_id", "chunk_idx"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[int] = mapped_column(Integer, ForeignKey("sync_sessions.id", ondelete="CASCADE"))
+    chunk_idx: Mapped[int] = mapped_column(Integer)
+    pos: Mapped[int] = mapped_column(Integer, default=0, server_default="0")   # position inside its chunk
+    value: Mapped[str] = mapped_column(String(2048))
+    yaml_list: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    invalid_reason: Mapped[str | None] = mapped_column(String(300), nullable=True)
+
+
+class ReclassJob(Base):
+    """A reclassification requested through the sync API (`reclassify=true`). The entries still waiting
+    for a fresh Panorama answer carry `entries.reclass_job_id`; the job is done when none are left. Stored
+    in the database, so a restart resumes it where it stopped."""
+
+    __tablename__ = "reclass_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    list_name: Mapped[str] = mapped_column(String(64), index=True)
+    host: Mapped[str] = mapped_column(String(64))
+    source_id: Mapped[str] = mapped_column(String(100))
+    sync_id: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(12), default="running")   # running | done
+    total: Mapped[int] = mapped_column(Integer, default=0)       # entries in scope
+    queued: Mapped[int] = mapped_column(Integer, default=0)      # left for the engine when the sync ended
+    changed: Mapped[int] = mapped_column(Integer, default=0)     # entries whose status changed (engine part)
+    kept_after_error: Mapped[int] = mapped_column(Integer, default=0)   # engine attempts that failed (retried)
 
 
 class CategoryCache(Base):

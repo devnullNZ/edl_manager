@@ -6,11 +6,11 @@ from app.shadow import compute_shadows
 
 
 @pytest.mark.parametrize("raw,expected", [
-    ("HTTPS://Example.COM/", "example.com"),
-    ("http://user:pw@www.example.com:8080/a/b/?q=1#frag", "www.example.com/a/b"),
-    ("*.Example.com", "*.example.com"),
-    ("example.com.", "example.com"),
-    ("  example.com/path/  ", "example.com/path"),
+    ("HTTPS://Example.COM/", "example.com/"),
+    ("http://user:pw@www.example.com:8080/a/b/?q=1#frag", "www.example.com/a/b/"),
+    ("*.Example.com", "*.example.com/"),
+    ("example.com.", "example.com/"),
+    ("  example.com/path/  ", "example.com/path/"),
 ])
 def test_normalize(raw, expected):
     assert normalize(raw) == expected
@@ -23,35 +23,35 @@ def test_normalize_rejects(raw):
 
 
 def test_wildcard_shadows_subdomains():
-    got = compute_shadows(["*.example.com", "1.example.com", "a.b.example.com"])
-    assert got == {"1.example.com": "*.example.com", "a.b.example.com": "*.example.com"}
+    got = compute_shadows(["*.example.com/", "1.example.com/", "a.b.example.com/"])
+    assert got == {"1.example.com/": "*.example.com/", "a.b.example.com/": "*.example.com/"}
 
 
 def test_apex_and_wildcard_both_kept():
-    assert compute_shadows(["example.com", "*.example.com"]) == {}
+    assert compute_shadows(["example.com/", "*.example.com/"]) == {}
 
 
 def test_nested_wildcard_shadowed_by_parent_wildcard():
-    got = compute_shadows(["*.a.example.com", "*.example.com"])
-    assert got == {"*.a.example.com": "*.example.com"}
+    got = compute_shadows(["*.a.example.com/", "*.example.com/"])
+    assert got == {"*.a.example.com/": "*.example.com/"}
 
 
 def test_nearest_wildcard_reported():
-    got = compute_shadows(["*.example.com", "*.b.example.com", "x.b.example.com"])
-    assert got["x.b.example.com"] == "*.b.example.com"
+    got = compute_shadows(["*.example.com/", "*.b.example.com/", "x.b.example.com/"])
+    assert got["x.b.example.com/"] == "*.b.example.com/"
 
 
 def test_path_entries():
     # wildcard without path covers any path; wildcard with same path covers that path only
-    assert compute_shadows(["*.example.com", "a.example.com/x"]) == {"a.example.com/x": "*.example.com"}
+    assert compute_shadows(["*.example.com/", "a.example.com/x"]) == {"a.example.com/x": "*.example.com/"}
     assert compute_shadows(["*.example.com/x", "a.example.com/x", "a.example.com/y"]) == {
         "a.example.com/x": "*.example.com/x"}
     # host-only entry does not shadow path entries on the same host
-    assert compute_shadows(["example.com", "example.com/x"]) == {}
+    assert compute_shadows(["example.com/", "example.com/x"]) == {}
 
 
 def test_unrelated_suffix_not_shadowed():
-    assert compute_shadows(["*.example.com", "notexample.com", "example.com.evil.net"]) == {}
+    assert compute_shadows(["*.example.com/", "notexample.com/", "example.com.evil.net/"]) == {}
 
 
 def test_lookup_target():

@@ -77,7 +77,7 @@ def on_settings_changed(db: Session, changed: set[str]) -> None:
     if changed & SOURCE_KEYS:
         n = service.clear_classification_cache(db)
         log.info("classification cache cleared (%d entries): Panorama source settings changed", n)
-    if "wildcard_classification_policy" in changed:
+    if changed & {"wildcard_classification_policy", "classification_enabled"}:
         service.reconcile_wildcards(db)  # immediate, needs no Panorama call
     if changed & (CLASSIFY_KEYS | SOURCE_KEYS):
         # entries may now classify differently: re-evaluate them in the background

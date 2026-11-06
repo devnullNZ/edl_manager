@@ -1,0 +1,3 @@
+-r requirements.txt
+pytest>=8
+# integration tests also need the EDL Publisher source tree (see tests/conftest.py, EDL_SERVER_SRC)

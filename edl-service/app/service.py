@@ -6,19 +6,18 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import timedelta
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .config import Settings, get_settings
 from . import settings_store
-from .db import AppSetting, CategoryCache, EdlSnapshot, Entry, utcnow
-from .normalize import MAX_SOURCE_LENGTH, EntryTooLong, normalize
+from .db import AppSetting, CategoryCache, EdlSnapshot, Entry, EntrySource, utcnow
+from .normalize import MAX_SOURCE_LENGTH, EntryTooLong, normalize, split_value
 from .config import MAX_PANORAMA_CONCURRENCY
-from .panorama import (Classification, MockPanoramaClient, PanoramaClient, PanoramaError, lookup_target,
-                       parse_result_text)
+from .panorama import (Classification, MockPanoramaClient, PanoramaClient, PanoramaError, parse_result_text)
 from .psl import is_public_suffix
-from .shadow import compute_shadows
+from .shadow import compute_shadows, suppressed_by
 
 log = logging.getLogger("edl")
 
@@ -81,17 +80,38 @@ def clear_classification_cache(db: Session) -> int:
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class Outcome:
-    kind: str  # clean | blocked | unknown | error | invalid | wildcard
+    kind: str  # clean | blocked | unknown | error | invalid | wildcard | pending | uncached
     detail: str | None = None
+    categories: tuple[str, ...] = ()
+    target: str | None = None      # what was submitted to Panorama (the apex domain, for wildcards)
+    method: str = "url"            # url | wildcard_apex
+    wildcard: bool = False
 
 
 WILDCARD_EXCLUDED = ("wildcard excluded by policy: Panorama classifies individual URLs and cannot vouch for "
                      "every subdomain this wildcard covers")
+WILDCARD_NEEDS_CLASSIFICATION = ("classification is disabled, but the wildcard policy requires the base domain to be "
+                                 "classified before a wildcard is published")
+WILDCARD_INCONCLUSIVE = ("inconclusive: Panorama gave no usable category for the base domain, so the wildcard "
+                         "stays pending (an inconclusive result is never treated as approval)")
 WILDCARD_APEX_NOTE = ("wildcard: only the base domain was classified; the category of subdomains is NOT verified")
 
 
 def _is_wildcard(value: str) -> bool:
     return value.startswith("*.")
+
+
+def classification_target(value: str) -> str:
+    """What is submitted to Panorama for an entry.
+
+    A wildcard is NEVER submitted literally: `*.example.com/` is classified as its apex `example.com`
+    and `*.sub.example.com/` as `sub.example.com`. That answer describes the apex only (see the
+    README: it does not prove every subdomain is safe). Other entries are submitted as host or
+    host/path."""
+    host, path = split_value(value)
+    if host.startswith("*."):
+        return host[2:]
+    return f"{host}/{path}" if path else host
 
 
 def _suffix_wildcard(value: str) -> bool:
@@ -107,45 +127,63 @@ def _chunks(items: list, n: int):
         yield items[i:i + n]
 
 
-def lookup_outcomes(db: Session, values: list[str], force: bool = False) -> dict[str, Outcome]:
-    """Ask Panorama (via the cache) about each entry. No policy is applied here."""
+def lookup_outcomes(db: Session, values: list[str], force: bool = False, *,
+                    cache_only: bool = False) -> dict[str, Outcome]:
+    """Ask Panorama (via the cache) about each entry. No status policy is applied here.
+
+    Identical targets are asked once (so a thousand `*.example.com` entries cost one request) and a
+    fresh cached answer is never re-requested. cache_only=True never contacts Panorama and never
+    writes: targets without a fresh cached answer come back as kind "uncached" (used by dry runs)."""
     s = get_settings()
     values = list(values)
     out: dict[str, Outcome] = {}
     for v in values:
         if _suffix_wildcard(v):
-            out[v] = Outcome("invalid", "wildcard targets a public suffix (not allowed)")
+            out[v] = Outcome("invalid", "wildcard targets a public suffix (not allowed)", wildcard=True,
+                             method="wildcard_apex")
     # Wildcard exclusion is a publishing policy, not a Panorama feature: it is enforced here, before
     # (and independently of) the classification switch, for new submissions and for every recheck.
     if s.wildcard_classification_policy == "exclude":
         for v in values:
             if v not in out and _is_wildcard(v):
-                out[v] = Outcome("wildcard", WILDCARD_EXCLUDED)
+                out[v] = Outcome("wildcard", WILDCARD_EXCLUDED, wildcard=True, method="wildcard_apex")
     values = [v for v in values if v not in out]
     if not s.classification_enabled:
-        out.update({v: Outcome("clean") for v in values})
+        for v in values:
+            if _is_wildcard(v):  # this policy requires the apex to be classified, so it cannot be approved
+                out[v] = Outcome("pending", WILDCARD_NEEDS_CLASSIFICATION, wildcard=True, method="wildcard_apex")
+            else:
+                out[v] = Outcome("clean")
         return out
 
     now = utcnow()
     ttl = timedelta(hours=s.classification_cache_ttl_hours)
-    targets = {v: lookup_target(v) for v in values}
+    targets = {v: classification_target(v) for v in values}
     unique = sorted(set(targets.values()))
 
     parsed: dict[str, Classification] = {}
     raw_by_target: dict[str, str] = {}
-    if not force and ttl.total_seconds() > 0:
-        for chunk in _chunks(unique, 500):
-            for row in db.scalars(select(CategoryCache).where(CategoryCache.target.in_(chunk))):
-                checked = row.checked_at if row.checked_at.tzinfo else row.checked_at.replace(tzinfo=now.tzinfo)
-                if now - checked < ttl:
-                    try:  # a cached answer that cannot be parsed (older format) is simply re-fetched
-                        parsed[row.target] = parse_result_text(row.raw, row.target)
-                        raw_by_target[row.target] = row.raw
-                    except PanoramaError:
-                        continue
+    # One query per 500 targets loads every existing cache row (fresh or stale): fresh ones answer the
+    # lookup, stale ones are updated in place below. No per-target query is ever made.
+    cache_rows: dict[str, CategoryCache] = {}
+    for chunk in _chunks(unique, 500):
+        for row in db.scalars(select(CategoryCache).where(CategoryCache.target.in_(chunk))):
+            cache_rows[row.target] = row
+            if force or ttl.total_seconds() <= 0:
+                continue
+            checked = row.checked_at if row.checked_at.tzinfo else row.checked_at.replace(tzinfo=now.tzinfo)
+            if now - checked < ttl:
+                try:  # a cached answer that cannot be parsed (older format) is simply re-fetched
+                    parsed[row.target] = parse_result_text(row.raw, row.target)
+                    raw_by_target[row.target] = row.raw
+                except PanoramaError:
+                    continue
 
     todo = [t for t in unique if t not in raw_by_target]
     errors: dict[str, str] = {}
+    uncached: set[str] = set()
+    if todo and cache_only:
+        uncached, todo = set(todo), []
     if todo:
         client, client_error = None, ""
         try:
@@ -173,7 +211,7 @@ def lookup_outcomes(db: Session, values: list[str], force: bool = False) -> dict
                     continue
                 raw_by_target[t] = raw
                 parsed[t] = parse_result_text(raw, t)
-                row = db.get(CategoryCache, t)
+                row = cache_rows.get(t)
                 if row:
                     row.raw, row.checked_at = raw, now
                 else:
@@ -182,18 +220,24 @@ def lookup_outcomes(db: Session, values: list[str], force: bool = False) -> dict
 
     high_risk = s.high_risk_set
     for value, target in targets.items():
+        wc = _is_wildcard(value)
+        method = "wildcard_apex" if wc else "url"
+        if target in uncached:
+            out[value] = Outcome("uncached", "no fresh cached classification", target=target, method=method, wildcard=wc)
+            continue
         if target in errors:
-            out[value] = Outcome("error", errors[target])
+            out[value] = Outcome("error", errors[target], target=target, method=method, wildcard=wc)
             continue
         c = parsed[target]
-        note = WILDCARD_APEX_NOTE if _is_wildcard(value) else None
+        note = WILDCARD_APEX_NOTE if wc else None
+        cats = tuple(sorted(c.categories))
         hits = sorted(set(c.categories) & high_risk)
         if hits:
-            out[value] = Outcome("blocked", ", ".join(hits) + (" (base domain)" if note else ""))
+            out[value] = Outcome("blocked", ", ".join(hits) + (" (base domain)" if note else ""), cats, target, method, wc)
         elif c.unknown:
-            out[value] = Outcome("unknown", note)
+            out[value] = Outcome("unknown", note, cats, target, method, wc)
         else:
-            out[value] = Outcome("clean", note)
+            out[value] = Outcome("clean", note, cats, target, method, wc)
     return out
 
 
@@ -218,6 +262,14 @@ def status_for(outcome: Outcome) -> tuple[str, str | None]:
         return "active", outcome.detail
     if outcome.kind in ("blocked", "invalid", "wildcard"):
         return "blocked", outcome.detail
+    if outcome.kind == "pending":
+        return "pending", outcome.detail
+    if outcome.wildcard and outcome.kind in ("error", "unknown"):
+        # Wildcards that need classification fail CLOSED whatever the failure and unknown-category
+        # settings say: an unavailable or inconclusive Panorama is never approval.
+        if outcome.kind == "error":
+            return "pending", f"awaiting classification of the base domain: {outcome.detail}"
+        return "pending", WILDCARD_INCONCLUSIVE
     if outcome.kind == "unknown":
         note = f"; {outcome.detail}" if outcome.detail else ""
         if s.unknown_category_behaviour == "publish":
@@ -231,6 +283,32 @@ def status_for(outcome: Outcome) -> tuple[str, str | None]:
 def classify(db: Session, values: list[str], force: bool = False) -> dict[str, tuple[str, str | None]]:
     """Return {entry value: (status, detail)}."""
     return {v: status_for(o) for v, o in lookup_outcomes(db, values, force).items()}
+
+
+_RESULT_FOR_KIND = {"clean": "clean", "blocked": "blocked", "unknown": "unknown", "error": "error",
+                    "wildcard": "excluded", "invalid": "invalid", "pending": "disabled", "uncached": "error"}
+
+
+def class_fields(outcome: Outcome, status: str) -> dict:
+    """The classification metadata stored on an entry (method, what was submitted, result, categories,
+    status). `detail` carries the human-readable reason; the timestamp is Entry.checked_at."""
+    if outcome.kind == "wildcard":
+        cstatus = "excluded"
+    else:
+        cstatus = {"active": "approved", "unverified": "unverified", "blocked": "blocked",
+                   "pending": "pending"}.get(status, status)
+    result = _RESULT_FOR_KIND.get(outcome.kind, outcome.kind)
+    if outcome.kind == "clean" and outcome.target is None:
+        result = "not_classified"
+    return {"class_method": outcome.method if outcome.target else None,
+            "class_target": outcome.target, "class_result": result,
+            "class_categories": ",".join(outcome.categories) or None, "class_status": cstatus}
+
+
+def set_classification(e: Entry, outcome: Outcome, status: str, detail: str | None, now) -> None:
+    e.status, e.detail, e.checked_at = status, detail, now
+    for k, v in class_fields(outcome, status).items():
+        setattr(e, k, v)
 
 
 # --------------------------------------------------------------------------- #
@@ -262,8 +340,38 @@ def check_lengths(urls: list[str], source: str | None = None) -> None:
         raise SubmissionError(errors)
 
 
-def add_urls(db: Session, list_name: str, urls: list[str], source: str | None) -> list[dict]:
+def split_owner(source: str | None) -> tuple[str, str]:
+    """(host, source note) from the composite source string `host[:note]`."""
+    host, _, note = (source or "anonymous").partition(":")
+    return (host or "anonymous")[:64], note[:100]
+
+
+def ensure_owners(db: Session, list_name: str, entry_ids: list[int], host: str, source_id: str,
+                  kind: str = "api", sync_id: str | None = None, now=None) -> int:
+    """Give each entry an owner row for (host, source_id) if it does not have one. Bulk, no per-row queries."""
+    have: set[int] = set()
+    for chunk in _chunks(entry_ids, 500):
+        have |= set(db.scalars(select(EntrySource.entry_id).where(
+            EntrySource.entry_id.in_(chunk), EntrySource.host == host, EntrySource.source_id == source_id)))
+    missing = [i for i in entry_ids if i not in have]
+    now = now or utcnow()
+    if missing:
+        db.execute(EntrySource.__table__.insert(), [
+            {"entry_id": i, "list_name": list_name, "kind": kind, "host": host, "source_id": source_id,
+             "created_at": now, "last_seen_at": now, "last_sync_id": sync_id} for i in missing])
+    return len(missing)
+
+
+def add_urls(db: Session, list_name: str, urls: list[str], source: str | None,
+             owner: tuple[str, str] | None = None) -> list[dict]:
     check_lengths(urls, source)  # before any database work
+    with list_lock(list_name):
+        return _add_urls(db, list_name, urls, source, owner)
+
+
+def _add_urls(db: Session, list_name: str, urls: list[str], source: str | None,
+              owner: tuple[str, str] | None) -> list[dict]:
+    owner_host, owner_note = owner or split_owner(source)
     results: list[dict] = []
     fresh: list[tuple[str, str]] = []  # (raw, value)
     seen: set[str] = set()
@@ -293,19 +401,28 @@ def add_urls(db: Session, list_name: str, urls: list[str], source: str | None) -
         else:
             to_classify.append((raw, value))
 
-    outcomes = classify(db, [v for _, v in to_classify])
+    raw_outcomes = lookup_outcomes(db, [v for _, v in to_classify])
     now = utcnow()
     for raw, value in to_classify:
-        status, detail = outcomes[value]
+        o = raw_outcomes[value]
+        status, detail = status_for(o)
         try:
             with db.begin_nested():
-                db.add(Entry(list_name=list_name, value=value, status=status, detail=detail,
-                             source=source, checked_at=now))
+                e = Entry(list_name=list_name, value=value, source=source, status=status)
+                set_classification(e, o, status, detail, now)
+                db.add(e)
+                db.flush()
+                db.add(EntrySource(entry_id=e.id, list_name=list_name, kind="api", host=owner_host,
+                                   source_id=owner_note, created_at=now, last_seen_at=now))
         except IntegrityError:
             results.append({"url": raw, "value": value, "status": "duplicate", "detail": "concurrent insert"})
             continue
         results.append({"url": raw, "value": value,
                         "status": "added" if status in PUBLISHED else status, "detail": detail})
+    # an entry that was already stored gains this submitter as an additional owner
+    dup_values = [r["value"] for r in results if r["status"] == "duplicate" and r.get("value") in existing]
+    if dup_values:
+        ensure_owners(db, list_name, [existing[v].id for v in set(dup_values)], owner_host, owner_note, now=now)
     db.commit()
 
     snapshot_inputs = published_values(db, list_name)
@@ -325,6 +442,11 @@ def add_urls(db: Session, list_name: str, urls: list[str], source: str | None) -
 
 def remove_urls(db: Session, list_name: str, urls: list[str]) -> int:
     check_lengths(urls)
+    with list_lock(list_name):
+        return _remove_urls(db, list_name, urls)
+
+
+def _remove_urls(db: Session, list_name: str, urls: list[str]) -> int:
     values = set()
     for u in urls:
         try:
@@ -335,6 +457,9 @@ def remove_urls(db: Session, list_name: str, urls: list[str]) -> int:
         return 0
     deleted = 0
     for chunk in _chunks(sorted(values), 500):
+        ids = list(db.scalars(select(Entry.id).where(Entry.list_name == list_name, Entry.value.in_(chunk))))
+        if ids:
+            db.execute(delete(EntrySource).where(EntrySource.entry_id.in_(ids)))
         res = db.execute(delete(Entry).where(Entry.list_name == list_name, Entry.value.in_(chunk)))
         deleted += res.rowcount or 0
     db.commit()
@@ -346,20 +471,34 @@ def remove_urls(db: Session, list_name: str, urls: list[str]) -> int:
 # Publishing: snapshots
 # --------------------------------------------------------------------------- #
 def published_rows(db: Session, list_name: str) -> list[tuple[int, str]]:
+    """Entries that are individually eligible: validated and classified acceptable (active, or
+    unverified under fail-open), and enabled. Suppression by wildcards is applied separately."""
     return [tuple(r) for r in db.execute(
-        select(Entry.id, Entry.value).where(Entry.list_name == list_name, Entry.status.in_(PUBLISHED)))]
+        select(Entry.id, Entry.value).where(Entry.list_name == list_name, Entry.status.in_(PUBLISHED),
+                                            Entry.enabled.is_not(False)))]
+
+
+def refresh_suppression(db: Session, list_name: str) -> int:
+    """Record, on each entry, which APPROVED wildcard (if any) suppresses it. Nothing is deleted:
+    when the wildcard is removed, blocked, disabled or goes back to pending the rows are released
+    again here. Only changed rows are written. Returns how many rows changed."""
+    rows = db.execute(select(Entry.id, Entry.value, Entry.status, Entry.enabled, Entry.suppressed_by)
+                      .where(Entry.list_name == list_name)).all()
+    approved = [v for _, v, st, en, _ in rows if v.startswith("*.") and st in PUBLISHED and en is not False]
+    new = suppressed_by((v for _, v, *_ in rows), approved)
+    changes = [{"id": i, "suppressed_by": new.get(v)} for i, v, _st, _en, cur in rows if new.get(v) != cur]
+    for chunk in _chunks(changes, 2000):
+        db.execute(update(Entry), chunk)
+    return len(changes)
 
 
 def published_values(db: Session, list_name: str) -> list[str]:
     return [v for _, v in published_rows(db, list_name)]
 
 
-def build_body(db: Session, list_name: str) -> tuple[str, int, int]:
-    """Return (feed text, entries published, eligible entries cut by the maximum).
-
-    Shadowed entries are removed first; if the maximum still applies, the oldest entries are
-    kept. Output is one entry per line, sorted, plain text."""
-    rows = published_rows(db, list_name)
+def effective_from_rows(rows: list[tuple[int, str]]) -> tuple[list[str], int]:
+    """The effective feed for eligible (id, value) rows: wildcard-suppressed entries removed, then the
+    configured maximum applied (oldest kept), sorted, no duplicates. Returns (values, cut by maximum)."""
     shadows = compute_shadows(v for _, v in rows)
     kept = sorted(((i, v) for i, v in rows if v not in shadows), key=lambda r: r[0])
     limit = get_settings().edl_max_entries
@@ -367,8 +506,27 @@ def build_body(db: Session, list_name: str) -> tuple[str, int, int]:
     if limit and len(kept) > limit:
         truncated = len(kept) - limit
         kept = kept[:limit]
-    values = sorted(v for _, v in kept)
+    return sorted({v for _, v in kept}), truncated
+
+
+def build_body(db: Session, list_name: str) -> tuple[str, int, int]:
+    """Return (feed text, entries published, eligible entries cut by the maximum).
+
+    The effective list contains only entries that are validated, approved (active, or unverified
+    under fail-open), enabled and not suppressed by an approved wildcard. Output is one entry per
+    line, sorted, plain text, so identical data always produces identical bytes."""
+    values, truncated = effective_from_rows(published_rows(db, list_name))
     return ("\n".join(values) + "\n" if values else ""), len(values), truncated
+
+
+_list_locks: dict[str, threading.RLock] = {}
+_list_locks_guard = threading.Lock()
+
+
+def list_lock(list_name: str) -> threading.RLock:
+    """One lock per list: serialises sync, submissions and removals for that list."""
+    with _list_locks_guard:
+        return _list_locks.setdefault(list_name, threading.RLock())
 
 
 _snapshot_lock = threading.RLock()  # serialises rebuilds so a slow, stale one cannot overwrite a newer one
@@ -378,44 +536,57 @@ def _snapshot_error_key(list_name: str) -> str:
     return f"snapshot_error:{list_name}"
 
 
-def rebuild_snapshot(db: Session, list_name: str) -> EdlSnapshot | None:
+def _apply_snapshot(db: Session, list_name: str) -> tuple[EdlSnapshot | None, bool]:
+    """Bring suppression and the stored feed up to date inside the CURRENT transaction (no commit).
+    Returns (snapshot, whether the stored feed changed). The feed is not touched when the effective
+    output is identical."""
+    s = get_settings()
+    refresh_suppression(db, list_name)
+    body, count, truncated = build_body(db, list_name)
+    snap = db.get(EdlSnapshot, list_name)
+    if count == 0 and snap is not None and snap.entry_count > 0 and s.edl_empty_behaviour == "keep-previous":
+        note = (f"Retained: no eligible entries remain, so the previous list ({snap.entry_count} "
+                "entries) is still being served (empty-list behaviour: keep-previous).")
+        if not snap.retained or snap.note != note:
+            snap.retained, snap.note = True, note
+            log.warning("list %s: %s", list_name, note)
+            return snap, True
+        return snap, False
+    etag = hashlib.sha256(body.encode()).hexdigest()[:32]
+    now = utcnow()
+    if snap is None:
+        snap = EdlSnapshot(list_name=list_name, body=body, entry_count=count, truncated=truncated,
+                           etag=etag, generated_at=now, retained=False, note=None)
+        db.add(snap)
+        return snap, True
+    if snap.etag != etag or snap.truncated != truncated or snap.retained:
+        snap.body, snap.entry_count, snap.truncated = body, count, truncated
+        snap.etag, snap.generated_at, snap.retained, snap.note = etag, now, False, None
+        return snap, True
+    return snap, False
+
+
+def rebuild_snapshot(db: Session, list_name: str, *, commit: bool = True) -> EdlSnapshot | None:
     """Regenerate the stored feed.
 
     The new body is built completely in memory first, then the snapshot row is replaced in ONE
     database transaction (body, count, etag and flags together). If anything fails, the
     transaction is rolled back, the previous snapshot is untouched and keeps being served, and
-    the failure is recorded so administrators can see it."""
+    the failure is recorded so administrators can see it.
+
+    commit=False is for callers that own a larger transaction (sync): the snapshot is written with
+    it, errors propagate so the caller rolls everything back, and nothing is committed here."""
     s = get_settings()
     with _snapshot_lock:
+        if not commit:
+            return _apply_snapshot(db, list_name)[0]
         try:
-            body, count, truncated = build_body(db, list_name)
-            snap = db.get(EdlSnapshot, list_name)
-            if count == 0 and snap is not None and snap.entry_count > 0 and s.edl_empty_behaviour == "keep-previous":
-                note = (f"Retained: no eligible entries remain, so the previous list ({snap.entry_count} "
-                        "entries) is still being served (empty-list behaviour: keep-previous).")
-                if not snap.retained or snap.note != note:
-                    snap.retained, snap.note = True, note
-                    db.commit()
-                    log.warning("list %s: %s", list_name, note)
-                _clear_snapshot_error(db, list_name)
-                return snap
-            etag = hashlib.sha256(body.encode()).hexdigest()[:32]
-            now = utcnow()
-            if snap is None:
-                snap = EdlSnapshot(list_name=list_name, body=body, entry_count=count, truncated=truncated,
-                                   etag=etag, generated_at=now, retained=False, note=None)
-                db.add(snap)
-            elif snap.etag != etag or snap.truncated != truncated or snap.retained:
-                snap.body, snap.entry_count, snap.truncated = body, count, truncated
-                snap.etag, snap.generated_at, snap.retained, snap.note = etag, now, False, None
-            else:
-                _clear_snapshot_error(db, list_name)
-                return snap
+            snap, changed = _apply_snapshot(db, list_name)
             db.commit()
             _clear_snapshot_error(db, list_name)
-            if truncated:
+            if changed and snap is not None and snap.truncated:
                 log.warning("list %s: %d eligible entries are not published (maximum %d reached)",
-                            list_name, truncated, s.edl_max_entries)
+                            list_name, snap.truncated, s.edl_max_entries)
             return snap
         except Exception as exc:
             db.rollback()
@@ -480,27 +651,43 @@ def reconcile_wildcards(db: Session) -> dict[str, int]:
     without calling Panorama and without deleting anything (rows are only re-statused).
 
     - wildcards over a public suffix (legacy data) -> blocked
-    - policy 'exclude': published wildcards -> blocked (reason recorded)
-    - policy 'apex-classification': wildcards previously excluded by policy -> pending, so the
-      engine classifies their base domain
-    Snapshots of affected lists are rebuilt."""
-    policy = get_settings().wildcard_classification_policy
-    counts = {"public_suffix": 0, "excluded": 0, "released": 0}
+    - policy 'exclude': published and pending wildcards -> blocked/excluded (reason recorded)
+    - policy 'apex-classification':
+        wildcards previously excluded by policy -> pending, so the base domain is classified
+        (nothing is published until that succeeds)
+        published wildcards while classification is disabled, or published without verification
+        (legacy fail-open) -> pending, because this policy requires the base domain to be classified
+    Blocked-by-classification wildcards keep their verdict until a recheck. Snapshots (and the
+    suppression recorded on subdomain rows) of affected lists are rebuilt."""
+    sset = get_settings()
+    policy = sset.wildcard_classification_policy
+    counts = {"public_suffix": 0, "excluded": 0, "released": 0, "demoted": 0}
     touched: set[str] = set()
     for e in db.scalars(select(Entry).where(Entry.value.like("*.%"))):
         if _suffix_wildcard(e.value):
             if e.status != "blocked" or not (e.detail or "").startswith("wildcard targets a public suffix"):
                 e.status, e.detail = "blocked", "wildcard targets a public suffix (not allowed)"
+                e.class_status, e.class_result = "blocked", "invalid"
                 counts["public_suffix"] += 1
                 touched.add(e.list_name)
         elif policy == "exclude":
             if e.status in PUBLISHED or e.status == "pending":
                 e.status, e.detail = "blocked", WILDCARD_EXCLUDED
+                e.class_status, e.class_result = "excluded", "excluded"
+                e.class_method = e.class_target = e.class_categories = None
                 counts["excluded"] += 1
                 touched.add(e.list_name)
         elif e.status == "blocked" and e.detail == WILDCARD_EXCLUDED:
             e.status, e.detail = "pending", "awaiting classification of the base domain"
+            e.class_status, e.class_result = "pending", None
             counts["released"] += 1
+            touched.add(e.list_name)
+        elif e.status == "unverified" or (e.status == "active" and not sset.classification_enabled):
+            e.status = "pending"
+            e.detail = WILDCARD_NEEDS_CLASSIFICATION if not sset.classification_enabled else \
+                "awaiting classification of the base domain"
+            e.class_status = "pending"
+            counts["demoted"] += 1
             touched.add(e.list_name)
     db.commit()
     if touched:
@@ -525,6 +712,32 @@ def get_snapshot(db: Session, list_name: str) -> EdlSnapshot | None:
     return db.get(EdlSnapshot, list_name) or rebuild_snapshot(db, list_name)
 
 
+# The encoded feed of each list is kept in memory, keyed by ETag. A request for an unchanged feed
+# (If-None-Match) is answered from a body-less query; a full request reuses the SAME bytes object, so
+# any number of concurrent downloads of a 100,000-entry feed share one copy instead of each decoding
+# and encoding several MB. The cache is only ever a copy of the stored snapshot: a changed ETag replaces it.
+_feed_cache: dict[str, tuple[str, bytes]] = {}
+
+
+def get_snapshot_meta(db: Session, list_name: str) -> EdlSnapshot | None:
+    """The snapshot row WITHOUT its (large) body column loaded."""
+    from sqlalchemy.orm import defer
+    return db.get(EdlSnapshot, list_name, options=[defer(EdlSnapshot.body)]) or rebuild_snapshot(db, list_name)
+
+
+def feed_bytes(db: Session, meta: EdlSnapshot) -> tuple[EdlSnapshot, bytes]:
+    """(snapshot, encoded body) for serving. Returns the snapshot whose body was actually read, so the
+    ETag sent always matches the bytes sent even if the feed was replaced a moment ago."""
+    hit = _feed_cache.get(meta.list_name)
+    if hit is not None and hit[0] == meta.etag:
+        return meta, hit[1]
+    full = db.execute(select(EdlSnapshot).where(EdlSnapshot.list_name == meta.list_name)
+                      .execution_options(populate_existing=True)).scalar_one()
+    data = full.body.encode()
+    _feed_cache[full.list_name] = (full.etag, data)
+    return full, data
+
+
 # --------------------------------------------------------------------------- #
 # Re-checking (categories change over time) and background processing
 # --------------------------------------------------------------------------- #
@@ -534,30 +747,46 @@ def recheck_entries(db: Session, entries: list[Entry], *, force: bool = True, re
     now = utcnow()
     changed = 0
     kept = 0
+    errors = sum(1 for e in entries if outcomes[e.value].kind == "error")
     for e in entries:
         o = outcomes[e.value]
         if o.kind == "error" and e.status in ("active", "blocked", "unverified"):
             # Panorama could not be asked this time. An entry that was classified earlier keeps its
             # status (and stays in / out of the feed) instead of being demoted by a transient outage.
             kept += 1
+            if e.status == "unverified":
+                e.checked_at = now  # attempted: the next batch of this run moves on to other entries
             continue
         status, detail = status_for(o)
         if status != e.status:
             changed += 1
             log.info("entry %s/%s: %s -> %s (%s)", e.list_name, e.value, e.status, status, detail)
-        e.status, e.detail, e.checked_at = status, detail, now
+        set_classification(e, o, status, detail, now)
     db.commit()
     if kept:
         log.warning("%d entries could not be re-checked (Panorama unavailable); their status is unchanged", kept)
-    return {"checked": len(entries), "changed": changed, "unchanged_after_error": kept}
+    return {"checked": len(entries), "changed": changed, "unchanged_after_error": kept, "errors": errors}
 
 
-def recheck(db: Session, list_name: str | None = None, *, force: bool = True, retries: bool = False) -> dict[str, int]:
+def recheck_wildcards(db: Session, list_name: str | None = None, *, force: bool = True) -> dict[str, int]:
+    """Re-classify only the stored wildcard entries (the admin 'recheck wildcards' action). Their
+    apex domains are de-duplicated, answered from the cache unless force=True, and fetched at most
+    max_concurrent_requests at a time. Nothing is deleted. An unreachable Panorama leaves entries
+    that were already classified exactly as they are."""
+    out = recheck(db, list_name, force=force, retries=True, wildcards_only=True)
+    out["policy"] = get_settings().wildcard_classification_policy
+    return out
+
+
+def recheck(db: Session, list_name: str | None = None, *, force: bool = True, retries: bool = False,
+            wildcards_only: bool = False) -> dict[str, int]:
     """Re-classify stored entries in batches (one list, or all). Snapshots are rebuilt afterwards,
     even if a batch fails part-way, so published data always reflects what was committed."""
     q = select(Entry.id)
     if list_name:
         q = q.where(Entry.list_name == list_name)
+    if wildcards_only:
+        q = q.where(Entry.value.like("*.%"))
     ids = list(db.scalars(q.order_by(Entry.id)))
     batch = get_settings().max_batch_size
     checked = changed = 0
@@ -576,15 +805,18 @@ def recheck(db: Session, list_name: str | None = None, *, force: bool = True, re
     return {"checked": checked, "changed": changed}
 
 
-def process_pending(db: Session) -> dict[str, int]:
+def process_pending(db: Session, *, before=None) -> dict[str, int]:
     """One batch of entries that could not be classified earlier (pending or unverified),
-    least recently attempted first."""
+    least recently attempted first. With `before`, only entries not attempted since that moment are
+    taken, so a run that keeps taking batches visits each entry once and then stops."""
     s = get_settings()
+    q = select(Entry).where(Entry.status.in_(("pending", "unverified")))
+    if before is not None:
+        q = q.where(or_(Entry.checked_at.is_(None), Entry.checked_at < before))
     entries = list(db.scalars(
-        select(Entry).where(Entry.status.in_(("pending", "unverified")))
-        .order_by(Entry.checked_at.is_(None).desc(), Entry.checked_at, Entry.id).limit(s.max_batch_size)))
+        q.order_by(Entry.checked_at.is_(None).desc(), Entry.checked_at, Entry.id).limit(s.max_batch_size)))
     if not entries:
-        return {"checked": 0, "changed": 0}
+        return {"checked": 0, "changed": 0, "errors": 0}
     try:
         return recheck_entries(db, entries, force=False, retries=True)
     finally:
@@ -592,6 +824,127 @@ def process_pending(db: Session) -> dict[str, int]:
         rebuild_snapshots(db, {e.list_name for e in entries})
 
 
-def pending_count(db: Session) -> int:
+def entry_breakdown(db: Session) -> list[dict]:
+    """Per list, how many stored entries are in each state (admin overview). The groups are those of the
+    admin entries page:
+
+      uploaded    every stored entry (the sum of the status groups below, plus nothing else)
+      approved    status 'active' (classified acceptable); of these `suppressed` are hidden by an approved
+                  wildcard and `disabled` are switched off administratively
+      blocked     high-risk or excluded; never published
+      pending     classification not obtained yet (fail-closed); never published; the backlog
+      unverified  classification failed under fail-open; published, re-checked in the background
+      published   what the feed currently serves (the stored snapshot)
+
+    `suppressed` and `disabled` overlap the status groups (an approved entry can be both)."""
     from sqlalchemy import func
-    return db.scalar(select(func.count()).select_from(Entry).where(Entry.status.in_(("pending", "unverified")))) or 0
+    q = select(Entry.list_name, Entry.status, Entry.enabled, Entry.suppressed_by.is_not(None), func.count()) \
+        .group_by(Entry.list_name, Entry.status, Entry.enabled, Entry.suppressed_by.is_not(None))
+    out: dict[str, dict] = {}
+    for lst, status, enabled, supp, n in db.execute(q):
+        d = out.setdefault(lst, {"list_name": lst, "uploaded": 0, "approved": 0, "blocked": 0, "pending": 0,
+                                 "unverified": 0, "suppressed": 0, "disabled": 0, "published": 0})
+        d["uploaded"] += n
+        key = "approved" if status == "active" else status
+        if key in d:
+            d[key] += n
+        if supp:
+            d["suppressed"] += n
+        if enabled is False:
+            d["disabled"] += n
+    for snap in db.scalars(select(EdlSnapshot)):
+        out.setdefault(snap.list_name, {"list_name": snap.list_name, "uploaded": 0, "approved": 0, "blocked": 0,
+                                        "pending": 0, "unverified": 0, "suppressed": 0, "disabled": 0,
+                                        "published": 0})["published"] = snap.entry_count
+    return [out[k] for k in sorted(out)]
+
+
+def pending_count(db: Session, *, before=None) -> int:
+    from sqlalchemy import func
+    q = select(func.count()).select_from(Entry).where(Entry.status.in_(("pending", "unverified")))
+    if before is not None:
+        q = q.where(or_(Entry.checked_at.is_(None), Entry.checked_at < before))
+    return db.scalar(q) or 0
+
+
+# --------------------------------------------------------------------------- #
+# Reclassification requested through the sync API
+# --------------------------------------------------------------------------- #
+def apply_reclassification(e: Entry, o: Outcome, now) -> str:
+    """Apply a FRESH Panorama answer to an entry that was explicitly sent for reclassification.
+    Returns 'changed', 'unchanged' or 'kept'.
+
+    Fail closed: a failed lookup (timeout, error, unparsable answer) changes nothing at all, and an entry
+    that was blocked because a high-risk category was found is only released by a conclusive answer: an
+    'unknown' answer leaves it blocked. A pending entry is never approved except through the same rules as
+    any new entry."""
+    if o.kind in ("error", "uncached"):
+        return "kept"
+    if o.kind == "unknown" and e.status == "blocked" and e.class_result == "blocked":
+        e.checked_at = now
+        return "kept"
+    status, detail = status_for(o)
+    changed = (e.status, e.detail, e.class_method, e.class_result, e.class_categories) != (
+        status, detail, o.method if o.target else None, class_fields(o, status)["class_result"],
+        class_fields(o, status)["class_categories"])
+    set_classification(e, o, status, detail, now)
+    return "changed" if changed else "unchanged"
+
+
+def reclass_remaining(db: Session, job_id: int | None = None) -> int:
+    from sqlalchemy import func
+    q = select(func.count()).select_from(Entry)
+    q = q.where(Entry.reclass_job_id == job_id) if job_id is not None else q.where(Entry.reclass_job_id.is_not(None))
+    return db.scalar(q) or 0
+
+
+def process_reclass(db: Session, *, after_id: int = 0) -> dict[str, int]:
+    """One batch of entries flagged by a sync's `reclassify`, in id order after `after_id`. Panorama is
+    asked again (the cache is refreshed), at most max_concurrent_requests at a time. An entry whose lookup
+    failed keeps its status AND its flag, so the next run retries it. Snapshots and wildcard suppression
+    are recomputed from what was committed."""
+    s = get_settings()
+    entries = list(db.scalars(select(Entry).where(Entry.reclass_job_id.is_not(None), Entry.id > after_id)
+                              .order_by(Entry.id).limit(s.max_batch_size)))
+    if not entries:
+        return {"checked": 0, "changed": 0, "kept": 0, "last_id": after_id}
+    from .db import ReclassJob
+    try:
+        values = sorted({e.value for e in entries})
+        outcomes = lookup_with_retries(db, values, True)
+        now = utcnow()
+        changed = kept = 0
+        per_job: dict[int, list[int]] = {}
+        for e in entries:
+            r = apply_reclassification(e, outcomes[e.value], now)
+            per = per_job.setdefault(e.reclass_job_id, [0, 0])
+            if r == "kept" and outcomes[e.value].kind in ("error", "uncached"):
+                kept += 1
+                per[1] += 1
+                continue          # flag stays: retried by a later run
+            e.reclass_job_id = None
+            if r == "changed":
+                changed += 1
+                per[0] += 1
+        for jid, (ch, kp) in per_job.items():
+            job = db.get(ReclassJob, jid)
+            if job is not None:
+                job.changed += ch
+                job.kept_after_error += kp
+        db.commit()
+        _finish_jobs(db)
+    finally:
+        db.rollback()
+        rebuild_snapshots(db, {e.list_name for e in entries})
+    return {"checked": len(entries), "changed": changed, "kept": kept, "last_id": entries[-1].id,
+            "errors": sum(1 for e in entries if outcomes[e.value].kind == "error")}
+
+
+def _finish_jobs(db: Session) -> None:
+    from sqlalchemy import func
+    from .db import ReclassJob
+    for job in db.scalars(select(ReclassJob).where(ReclassJob.status == "running")):
+        left = db.scalar(select(func.count()).select_from(Entry).where(Entry.reclass_job_id == job.id)) or 0
+        if left == 0:
+            job.status, job.finished_at = "done", utcnow()
+    db.commit()

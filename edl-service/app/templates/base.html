@@ -82,6 +82,10 @@
   <a href="/admin/settings" class="{{ 'on' if active == 'overview' }}">Overview</a>
   <div class="navhead">Settings</div>
   {% for s in sections %}<a href="/admin/settings/{{ s.id }}" class="{{ 'on' if active == s.id }}">{{ s.label }}</a>{% endfor %}
+  <div class="navhead">Lists</div>
+  <a href="/admin/entries" class="{{ 'on' if active == 'entries' }}">Entries</a>
+  <a href="/admin/wildcards" class="{{ 'on' if active == 'wildcards' }}">Wildcards</a>
+  <a href="/admin/sync" class="{{ 'on' if active == 'sync' }}">Sync</a>
   <div class="navhead">Access</div>
   <a href="/admin/hosts" class="{{ 'on' if active == 'hosts' }}">Hosts</a>
   <a href="/admin/audit" class="{{ 'on' if active == 'audit' }}">Audit log</a>
