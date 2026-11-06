@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Wildcards{% endblock %}
+{% block content %}
+<h1>Wildcard entries</h1>
+<p class="muted">Panorama classifies individual URLs. Under <strong>Classify Apex Domain</strong> only the base domain of a wildcard
+(<code>*.example.com/</code> &rarr; <code>example.com</code>) is classified, and that does <strong>not</strong> prove that every
+subdomain is safe. Only <em>approved</em> wildcards suppress the subdomain entries they cover; nothing is ever deleted for that reason.</p>
+
+<div class="card">
+  <dl class="kv">
+    <dt>Wildcard policy</dt><dd><strong>{{ policy_label }}</strong>
+      <span class="muted">(change it under <a href="/admin/settings/classification">URL Classification</a>)</span></dd>
+    <dt>Classification</dt><dd>{% if classification_on %}enabled{% else %}<span class="tag warn">disabled</span> wildcards cannot be approved while this is off{% endif %}</dd>
+    <dt>Wildcards stored</dt><dd>{{ data.total }}
+      {% for k, n in data.summary.items() | sort %}<span class="tag {{ 'muted' if k in ('pending','excluded') else ('err' if k == 'blocked' else '') }}">{{ k }}: {{ n }}</span> {% endfor %}</dd>
+  </dl>
+  <form method="post" action="/admin/wildcards/recheck" style="margin-top:12px">
+    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+    <button class="primary">Recheck wildcard classifications</button>
+    <span class="muted">Asks Panorama again for each distinct base domain (at most 5 requests at a time). Nothing is deleted;
+    if Panorama is unreachable, entries already classified keep their status.</span>
+  </form>
+</div>
+
+<div class="card">
+  <table>
+    <thead><tr><th>List</th><th>Wildcard</th><th>Status</th><th>Base domain submitted</th><th>Categories</th><th>Method</th><th>Checked</th><th>Suppresses</th><th>Reason</th></tr></thead>
+    <tbody>
+    {% for w in data.wildcards %}
+      <tr>
+        <td>{{ w.list }}</td>
+        <td><code>{{ w.wildcard }}</code></td>
+        <td><span class="tag {{ 'err' if w.status == 'blocked' else ('muted' if w.status == 'pending' else '') }}">{{ w.status }}</span>
+            {% if w.classification.status == 'excluded' %}<span class="tag muted">excluded</span>{% endif %}
+            {% if w.published %}<span class="tag">published</span>{% endif %}
+            {% if w.suppressed_by %}<div class="muted">suppressed by <code>{{ w.suppressed_by }}</code></div>{% endif %}</td>
+        <td>{% if w.classification.target %}<code>{{ w.classification.target }}</code>{% else %}<span class="muted">&mdash;</span>{% endif %}</td>
+        <td>{{ w.classification.categories | join(', ') }}</td>
+        <td>{{ w.classification.method or '' }}</td>
+        <td>{{ w.classification.at | localtime('%Y-%m-%d %H:%M') if w.classification.at else '' }}</td>
+        <td>{{ w.suppresses }}</td>
+        <td>{{ w.classification.reason or '' }}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="9" class="muted">No wildcard entries.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+<div class="bar">
+  {% if page > 1 %}<a class="btn" href="/admin/wildcards?page={{ page - 1 }}">Previous</a>{% endif %}
+  <span class="muted">Page {{ page }} of {{ pages }}</span>
+  {% if page < pages %}<a class="btn" href="/admin/wildcards?page={{ page + 1 }}">Next</a>{% endif %}
+</div>
+{% endblock %}

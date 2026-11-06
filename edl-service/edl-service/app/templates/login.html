@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Sign in{% endblock %}
+{% block content %}
+<div class="card" style="max-width:380px;margin:60px auto">
+  <h1>{{ app_name }}</h1>
+  <p class="muted">{{ app_description }}</p>
+  {% if error %}<div class="banner err">{{ error }}</div>{% endif %}
+  <form method="post" action="/admin/login">
+    <input type="hidden" name="csrf_token" value="{{ csrf }}">
+    <p><label for="username">Username</label><br><input type="text" id="username" name="username" autocomplete="username" autofocus></p>
+    <p><label for="password">Password</label><br><input type="password" id="password" name="password" autocomplete="current-password"></p>
+    <button class="primary">Sign in</button>
+  </form>
+</div>
+{% endblock %}

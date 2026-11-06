@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Sync report {{ run.id }}{% endblock %}
+{% block content %}
+<h1>Sync report #{{ run.id }}</h1>
+<p><a href="/admin/sync">&larr; All syncs</a></p>
+<div class="card">
+  <dl class="kv">
+    <dt>List</dt><dd>{{ run.list }}</dd>
+    <dt>Host / source</dt><dd>{{ run.host }} / <code>{{ run.source }}</code></dd>
+    <dt>Sync id</dt><dd><code>{{ run.sync_id }}</code></dd>
+    <dt>Finished</dt><dd>{{ run.finished_at | localtime('%Y-%m-%d %H:%M:%S') if run.finished_at else '' }}</dd>
+    <dt>Status</dt><dd><span class="tag {{ 'err' if run.status == 'failed' else '' }}">{{ run.status }}</span></dd>
+    {% if run.error %}<dt>Error</dt><dd>{{ run.error }}</dd>{% endif %}
+    {% if run.report and run.report.warning %}<dt>Warning</dt><dd>{{ run.report.warning }}</dd>{% endif %}
+    {% if run.report %}<dt>Feed</dt><dd>{{ run.report.feed.entries_before }} &rarr; {{ run.report.feed.entries_after }} entries
+      (+{{ run.report.feed.added }} / &minus;{{ run.report.feed.removed }})</dd>{% endif %}
+  </dl>
+</div>
+<div class="card">
+  <h2>Counts</h2>
+  <dl class="kv">{% for k, v in run.counts.items() %}<dt>{{ k | replace('_', ' ') }}</dt><dd>{{ v }}</dd>{% endfor %}</dl>
+</div>
+{% if run.report %}
+<div class="card">
+  <h2>Entries{% if run.report.entries_truncated %} <span class="muted">(first {{ run.report.entries | length }} shown)</span>{% endif %}</h2>
+  <table>
+    <thead><tr><th>Entry</th><th>Action</th><th>Status</th><th>Published</th><th>Reason</th></tr></thead>
+    <tbody>
+    {% for e in run.report.entries %}
+      <tr><td><code>{{ e.entry }}</code></td><td>{{ e.action }}</td><td>{{ e.status }}</td>
+          <td>{{ 'yes' if e.published else 'no' }}</td><td>{{ e.reason }}</td></tr>
+    {% else %}<tr><td colspan="5" class="muted">No entry-level changes.</td></tr>{% endfor %}
+    </tbody>
+  </table>
+  {% if run.report.invalid %}<h2>Invalid</h2><ul>{% for i in run.report.invalid %}<li><code>{{ i.entry }}</code>: {{ i.reason }}</li>{% endfor %}</ul>{% endif %}
+</div>
+{% endif %}
+{% endblock %}

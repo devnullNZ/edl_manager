@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Admin{% endblock %} · {{ app_name }}</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --fg:#1b1f24; --muted:#5b6672; --line:#d9dde3; --accent:#1f6feb;
+          --ok:#1a7f37; --okbg:#e6f4ea; --warn:#9a6700; --warnbg:#fff4d6; --err:#b42318; --errbg:#fde8e6; --side:#eef0f3; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#13161a; --card:#1b2026; --fg:#e6e9ee; --muted:#9aa5b1; --line:#2d353f; --accent:#58a6ff;
+            --ok:#56d364; --okbg:#12261a; --warn:#e3b341; --warnbg:#2d2410; --err:#ff7b72; --errbg:#2f1614; --side:#171b20; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, sans-serif; }
+  .layout { display:flex; min-height:100vh; }
+  aside { width:230px; flex:none; background:var(--side); border-right:1px solid var(--line); padding:16px 10px; display:flex; flex-direction:column; gap:2px; }
+  .brand { font-weight:700; padding:2px 10px 12px; }
+  aside a { display:block; padding:7px 10px; border-radius:6px; color:var(--fg); text-decoration:none; }
+  aside a:hover { background:var(--card); }
+  aside a.on { background:var(--card); box-shadow:inset 3px 0 0 var(--accent); font-weight:600; }
+  .navhead { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); padding:12px 10px 4px; }
+  aside form { margin-top:auto; padding:12px 10px 0; }
+  main { flex:1; min-width:0; max-width:980px; margin:24px auto; padding:0 20px 48px; }
+  h1 { font-size:20px; margin:0 0 6px; }
+  h2 { font-size:16px; margin:0 0 10px; }
+  .card, fieldset { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px 18px; margin:0 0 18px; }
+  legend { font-weight:600; padding:0 6px; }
+  .row { display:grid; grid-template-columns:240px 1fr; gap:4px 16px; padding:9px 0; align-items:start; border-top:1px solid var(--line); }
+  .row:first-of-type { border-top:0; }
+  .row > label, .row > .lab { font-weight:500; padding-top:6px; }
+  .help { grid-column:2; margin:0; color:var(--muted); font-size:13px; }
+  .unit { color:var(--muted); font-size:13px; margin-left:6px; }
+  input[type=text], input[type=password], input[type=number], select, textarea {
+    width:100%; max-width:480px; padding:7px 9px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); font:inherit; }
+  input[type=number] { max-width:180px; }
+  textarea { min-height:64px; font-family:ui-monospace, monospace; font-size:13px; }
+  input[type=checkbox] { width:18px; height:18px; margin-top:8px; }
+  .checks { display:grid; grid-template-columns:repeat(auto-fill, minmax(230px,1fr)); gap:2px 12px; }
+  .checks label { display:flex; align-items:center; gap:8px; font-weight:400; padding:2px 0; }
+  .checks input { margin:0; }
+  button, .btn { display:inline-block; padding:7px 14px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); font:inherit; cursor:pointer; text-decoration:none; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button.danger { color:var(--err); }
+  .banner { border-radius:8px; padding:10px 14px; margin:0 0 16px; border:1px solid; }
+  .banner.ok { background:var(--okbg); color:var(--ok); border-color:var(--ok); }
+  .banner.warn { background:var(--warnbg); color:var(--warn); border-color:var(--warn); }
+  .banner.err { background:var(--errbg); color:var(--err); border-color:var(--err); }
+  .banner.muted { background:var(--card); color:var(--muted); border-color:var(--line); }
+  .tag { font-size:11px; padding:1px 7px; border-radius:10px; background:var(--okbg); color:var(--ok); font-weight:500; }
+  .tag.off, .tag.err { background:var(--errbg); color:var(--err); }
+  .tag.warn { background:var(--warnbg); color:var(--warn); }
+  .tag.muted { background:var(--side); color:var(--muted); }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
+  code, pre { font-family:ui-monospace, monospace; font-size:13px; }
+  pre { background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:10px; overflow:auto; margin:8px 0 0; white-space:pre-wrap; word-break:break-all; }
+  .actions { display:flex; gap:6px; flex-wrap:wrap; }
+  .actions form { margin:0; }
+  details { margin-top:6px; }
+  details form { display:grid; gap:6px; margin-top:8px; min-width:280px; }
+  .inline { display:inline-flex; gap:6px; align-items:center; font-weight:400; padding:0; margin-left:12px; }
+  .inline input { margin:0; }
+  .bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .muted { color:var(--muted); }
+  .kv { display:grid; grid-template-columns:230px 1fr; gap:3px 16px; margin:0; }
+  .kv dt { color:var(--muted); } .kv dd { margin:0; word-break:break-word; }
+  @media (max-width:800px) {
+    .layout { flex-direction:column; }
+    aside { width:auto; flex-direction:row; flex-wrap:wrap; align-items:center; border-right:0; border-bottom:1px solid var(--line); }
+    .navhead { display:none; } aside form { margin:0 0 0 auto; padding:0; } .brand { padding:0 10px; }
+    .row, .kv { grid-template-columns:1fr; } .help { grid-column:1; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+{% if admin %}
+<aside>
+  <div class="brand">{{ app_name }}</div>
+  <a href="/admin/settings" class="{{ 'on' if active == 'overview' }}">Overview</a>
+  <div class="navhead">Settings</div>
+  {% for s in sections %}<a href="/admin/settings/{{ s.id }}" class="{{ 'on' if active == s.id }}">{{ s.label }}</a>{% endfor %}
+  <div class="navhead">Lists</div>
+  <a href="/admin/entries" class="{{ 'on' if active == 'entries' }}">Entries</a>
+  <a href="/admin/wildcards" class="{{ 'on' if active == 'wildcards' }}">Wildcards</a>
+  <a href="/admin/sync" class="{{ 'on' if active == 'sync' }}">Sync</a>
+  <div class="navhead">Access</div>
+  <a href="/admin/hosts" class="{{ 'on' if active == 'hosts' }}">Hosts</a>
+  <a href="/admin/audit" class="{{ 'on' if active == 'audit' }}">Audit log</a>
+  <form method="post" action="/admin/logout"><input type="hidden" name="csrf_token" value="{{ csrf }}"><button>Sign out</button></form>
+</aside>
+{% endif %}
+<main>
+{% for kind, msg in system_warnings %}<div class="banner {{ kind }}" role="alert">{% if kind == 'err' %}<strong>Warning:</strong> {% endif %}{{ msg }}</div>{% endfor %}
+{% if mock_mode %}<div class="banner warn">Panorama is in <strong>mock mode</strong>: categories are simulated. Do not use this for production feeds.</div>{% endif %}
+{% for kind, msg in flashes %}<div class="banner {{ kind }}">{{ msg }}</div>{% endfor %}
+{% block content %}{% endblock %}
+</main>
+</div>
+</body>
+</html>

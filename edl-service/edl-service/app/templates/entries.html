@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Entries{% endblock %}
+{% block content %}
+<h1>Entries</h1>
+<p class="muted">Stored source entries versus the effective published list: an entry is published only when it is approved,
+enabled and not suppressed by an approved wildcard.</p>
+<form method="get" action="/admin/entries" class="bar card">
+  <input type="text" name="q" value="{{ q }}" placeholder="contains…" style="max-width:220px">
+  <input type="text" name="list" value="{{ list_name }}" placeholder="list" style="max-width:140px">
+  <select name="status" style="max-width:150px">
+    <option value="">any status</option>
+    {% for st in ('active','blocked','pending','unverified') %}<option value="{{ st }}" {{ 'selected' if status == st }}>{{ st }}</option>{% endfor %}
+  </select>
+  <select name="show" style="max-width:170px">
+    <option value="">all entries</option>
+    <option value="wildcards" {{ 'selected' if show == 'wildcards' }}>wildcards only</option>
+    <option value="suppressed" {{ 'selected' if show == 'suppressed' }}>suppressed only</option>
+  </select>
+  <button>Filter</button><span class="muted">{{ data.total }} match(es)</span>
+</form>
+<div class="card">
+  <table>
+    <thead><tr><th>Entry</th><th>Status</th><th>Classification</th><th>Owners</th><th>Last sync</th></tr></thead>
+    <tbody>
+    {% for e in data.entries %}
+      <tr>
+        <td><code>{{ e.value }}</code><div class="muted">{{ e.list }}</div></td>
+        <td><span class="tag {{ 'err' if e.status == 'blocked' else ('muted' if e.status == 'pending' else '') }}">{{ e.status }}</span>
+            {% if e.published %}<span class="tag">published</span>{% endif %}
+            {% if not e.enabled %}<span class="tag off">disabled</span>{% endif %}
+            {% if e.suppressed_by %}<div class="muted">suppressed by <code>{{ e.suppressed_by }}</code></div>{% endif %}</td>
+        <td>{% if e.classification.method %}{{ e.classification.method }}: <code>{{ e.classification.target }}</code> &rarr; {{ e.classification.result }}
+            {% if e.classification.categories %}({{ e.classification.categories | join(', ') }}){% endif %}
+            <div class="muted">{{ e.classification.at | localtime('%Y-%m-%d %H:%M') if e.classification.at else '' }}</div>
+            {% else %}<span class="muted">{{ e.classification.result or '—' }}</span>{% endif %}
+            {% if e.classification.reason %}<div class="muted">{{ e.classification.reason }}</div>{% endif %}</td>
+        <td>{% for o in e.owners %}<div><span class="tag muted">{{ o.kind }}</span> {{ o.host }}{% if o.source %} / <code>{{ o.source }}</code>{% endif %}{% if o.yaml_list %} <span class="muted">({{ o.yaml_list }})</span>{% endif %}</div>{% else %}<span class="muted">manual</span>{% endfor %}</td>
+        <td>{% for o in e.owners if o.kind == 'sync' %}<div>{{ o.source_last_sync_at | localtime('%Y-%m-%d %H:%M') if o.source_last_sync_at else '' }}</div>{% endfor %}</td>
+      </tr>
+    {% else %}<tr><td colspan="5" class="muted">No entries match.</td></tr>{% endfor %}
+    </tbody>
+  </table>
+</div>
+<div class="bar">
+  {% set qs = 'q=' ~ (q | urlencode) ~ '&list=' ~ (list_name | urlencode) ~ '&status=' ~ status ~ '&show=' ~ show %}
+  {% if page > 1 %}<a class="btn" href="/admin/entries?{{ qs }}&page={{ page - 1 }}">Previous</a>{% endif %}
+  <span class="muted">Page {{ page }} of {{ pages }}</span>
+  {% if page < pages %}<a class="btn" href="/admin/entries?{{ qs }}&page={{ page + 1 }}">Next</a>{% endif %}
+</div>
+{% endblock %}

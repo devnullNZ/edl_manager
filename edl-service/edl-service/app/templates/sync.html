@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}Sync{% endblock %}
+{% block content %}
+<h1>Source sync</h1>
+<p class="muted">Importers describe the entries they want; the server works out the changes
+(<code>POST /v1/lists/{name}/sync</code>). Each source only ever removes entries it owns, and only when it sends
+<code>delete_missing=true</code>. Host tokens are never shown here.</p>
+
+<h2>Sources</h2>
+<div class="card">
+  <table>
+    <thead><tr><th>List</th><th>Host</th><th>Source</th><th>Last sync</th><th>Status</th><th>Added</th><th>Removed</th><th>Unchanged</th><th>Blocked</th><th>Suppressed</th><th>Pending</th><th>Errors</th></tr></thead>
+    <tbody>
+    {% for s in sources %}
+      {% set c = s.counts %}
+      <tr>
+        <td>{{ s.list }}</td><td>{{ s.host }}</td><td><code>{{ s.source }}</code></td>
+        <td>{{ s.last_sync_at | localtime('%Y-%m-%d %H:%M:%S') if s.last_sync_at else '' }}<div class="muted"><code>{{ s.last_sync_id }}</code></div></td>
+        <td><span class="tag {{ 'err' if s.status and s.status.startswith('failed') else ('warn' if 'errors' in (s.status or '') else '') }}">{{ s.status }}</span>
+            {% if s.run_id %}<a href="/admin/sync/runs/{{ s.run_id }}">report</a>{% endif %}</td>
+        <td>{{ c.get('new', '') }}</td><td>{{ c.get('removed', '') }}</td><td>{{ c.get('unchanged', '') }}</td>
+        <td>{{ (c.get('blocked_by_policy', 0) + c.get('blocked_by_classification', 0)) if c else '' }}</td>
+        <td>{{ c.get('suppressed_by_shadowing', '') }}</td><td>{{ c.get('pending_classification', '') }}</td>
+        <td>{{ c.get('processing_errors', '') }}{% if c.error %}{{ c.error }}{% endif %}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="12" class="muted">No source has synced yet.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<h2>Previous sync reports</h2>
+<div class="card">
+  <table>
+    <thead><tr><th>#</th><th>Time</th><th>List</th><th>Host / source</th><th>Sync id</th><th>Status</th><th>New</th><th>Removed</th><th>Pending</th><th>Errors</th></tr></thead>
+    <tbody>
+    {% for r in runs.runs %}
+      <tr>
+        <td><a href="/admin/sync/runs/{{ r.id }}">{{ r.id }}</a></td>
+        <td>{{ r.finished_at | localtime('%Y-%m-%d %H:%M:%S') if r.finished_at else '' }}</td>
+        <td>{{ r.list }}</td><td>{{ r.host }} / <code>{{ r.source }}</code></td><td><code>{{ r.sync_id }}</code></td>
+        <td><span class="tag {{ 'err' if r.status == 'failed' else '' }}">{{ r.status }}</span></td>
+        <td>{{ r.counts.get('new', '') }}</td><td>{{ r.counts.get('removed', '') }}</td>
+        <td>{{ r.counts.get('pending_classification', '') }}</td>
+        <td>{{ r.counts.get('processing_errors', '') }}{% if r.error %} {{ r.error }}{% endif %}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="10" class="muted">Nothing recorded yet.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+<div class="bar">
+  {% if page > 1 %}<a class="btn" href="/admin/sync?page={{ page - 1 }}">Newer</a>{% endif %}
+  <span class="muted">Page {{ page }} of {{ pages }}</span>
+  {% if page < pages %}<a class="btn" href="/admin/sync?page={{ page + 1 }}">Older</a>{% endif %}
+</div>
+{% endblock %}
