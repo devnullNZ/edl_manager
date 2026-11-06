@@ -24,7 +24,7 @@ By default, each YAML `url[].name` becomes an EDL Publisher list name. This pres
 
 If you want every URL in one EDL, use `--target-list default`. The YAML list names are still counted in the pre-import report, but the destination is consolidated.
 
-EDL Publisher list names must match `[A-Za-z0-9_-]{1,64}`. The submitting host must be permitted to write to every destination list. A host configured with permitted lists `*` can write to all lists. IP restrictions must also permit the machine running the importer.
+EDL Publisher list names must match `[A-Za-z0-9_-]{1,64}`. The importer automatically replaces each run of whitespace in a YAML list name with a single underscore (for example, `Threat Feeds APAC` becomes `Threat_Feeds_APAC`). If two distinct YAML names would become the same destination name (for example, `Threat Feeds` and `Threat_Feeds`), the importer stops and reports the collision rather than silently combining them. The submitting host must be permitted to write to every destination list. A host configured with permitted lists `*` can write to all lists. IP restrictions must also permit the machine running the importer.
 
 ## Install
 

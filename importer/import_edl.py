@@ -74,6 +74,7 @@ def parse_yaml(path: Path) -> tuple[dict[str, list[str]], dict[str, str], int]:
     lists: dict[str, list[str]] = defaultdict(list)
     descriptions: dict[str, str] = {}
     block_count = 0
+    original_names: dict[str, str] = {}
 
     try:
         with path.open("r", encoding="utf-8-sig") as stream:
@@ -101,17 +102,38 @@ def parse_yaml(path: Path) -> tuple[dict[str, list[str]], dict[str, str], int]:
                         raise ImportErrorDetail(
                             f"YAML document {doc_no}, url item {block_no}: expected a mapping"
                         )
-                    name = str(item.get("name", "")).strip()
-                    if not name:
+                    original_name = str(item.get("name", "")).strip()
+                    if not original_name:
                         raise ImportErrorDetail(
                             f"YAML document {doc_no}, url item {block_no}: missing 'name'"
                         )
+
+                    # Convert each contiguous whitespace run to one underscore.
+                    name = re.sub(r"\s+", "_", original_name)
+                    if name != original_name:
+                        print(
+                            f"List name normalised: {original_name!r} -> {name!r}",
+                            file=sys.stderr,
+                        )
+
                     if not LIST_NAME_RE.fullmatch(name):
                         raise ImportErrorDetail(
-                            f"YAML list name {name!r} is not valid for EDL Publisher. "
-                            "Names must be 1-64 letters, digits, underscores or hyphens. "
-                            "Use --target-list to map all YAML lists into one valid EDL."
+                            f"YAML list name {original_name!r} becomes {name!r}, which is "
+                            "still invalid for EDL Publisher. After whitespace replacement, "
+                            "names must contain only letters, digits, underscores or hyphens "
+                            "and be 1-64 characters long. Use --target-list to map all YAML "
+                            "lists into one valid EDL."
                         )
+
+                    previous_original = original_names.get(name)
+                    if previous_original is not None and previous_original != original_name:
+                        raise ImportErrorDetail(
+                            f"YAML list-name collision: {previous_original!r} and "
+                            f"{original_name!r} both become {name!r} after whitespace "
+                            "replacement. Rename one of the YAML lists or use --target-list "
+                            "if you intentionally want to combine them."
+                        )
+                    original_names[name] = original_name
 
                     list_type = str(item.get("type", "URL List")).strip().lower()
                     if list_type not in ("url list", "url"):
